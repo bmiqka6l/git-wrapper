@@ -1,35 +1,35 @@
 #!/bin/bash
 set -e
 
-# ==================== 配置 ====================
-# 约定: 填入干净的 URL (不带 username@)
-# 例如: https://dev.azure.com/org/proj/_git/repo
+# ==================== 0. 环境变量 ====================
 REPO_URL="$GW_REPO_URL"
 USERNAME="${GW_USER:-git}" 
 PAT="$GW_PAT"
 BRANCH="${GW_BRANCH:-main}"
 INTERVAL="${GW_INTERVAL:-300}"
 SYNC_MAP="$GW_SYNC_MAP"
+
+# 从 Dockerfile 传来的原镜像配置
 ORIGINAL_ENTRYPOINT="$GW_ORIGINAL_ENTRYPOINT"
 ORIGINAL_CMD="$GW_ORIGINAL_CMD"
+ORIGINAL_WORKDIR="$GW_ORIGINAL_WORKDIR"
 
 GIT_STORE="/git-store"
 
-# ==================== 1. URL 构造 ====================
+# ==================== 1. 准备工作 ====================
 if [ -z "$REPO_URL" ] || [ -z "$PAT" ] || [ -z "$SYNC_MAP" ]; then
-    echo "[GitWrapper] [ERROR] Missing required env vars (GW_REPO_URL, GW_PAT, GW_SYNC_MAP)."
+    echo "[GitWrapper] [ERROR] Missing env vars: GW_REPO_URL, GW_PAT, or GW_SYNC_MAP."
 fi
 
+# URL 协议探测与清洗
 case "$REPO_URL" in
     http://*) PROTOCOL="http://" ;;
     *)        PROTOCOL="https://" ;;
 esac
-
 CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
-
 AUTH_URL="${PROTOCOL}${USERNAME}:${PAT}@${CLEAN_URL}"
 
-# ==================== 2. 核心函数 ====================
+# ==================== 2. 核心逻辑 ====================
 
 restore_data() {
     echo "[GitWrapper] >>> Initializing..."
@@ -41,8 +41,7 @@ restore_data() {
 
     if [ -d "$GIT_STORE" ]; then rm -rf "$GIT_STORE"; fi
     
-    # 允许 Clone 失败 (可能是空仓库)
-    echo "[GitWrapper] Cloning repo..."
+    # 允许 Clone 失败 (应对空仓库)
     git clone "$AUTH_URL" "$GIT_STORE" > /dev/null 2>&1 || true
 
     if [ ! -d "$GIT_STORE/.git" ]; then
@@ -52,18 +51,17 @@ restore_data() {
 
     cd "$GIT_STORE"
 
-    # --- 空仓库自动初始化 ---
+    # 空仓库初始化
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-        echo "[GitWrapper] [WARN] Empty repo detected. Initializing branch '$BRANCH'..."
+        echo "[GitWrapper] [WARN] Empty repo detected. Initializing '$BRANCH'..."
         git checkout -b "$BRANCH" 2>/dev/null || true
-        git commit --allow-empty -m "Init by GitWrapper"
+        git commit --allow-empty -m "Init"
         git push -u origin "$BRANCH"
-        echo "[GitWrapper] [INFO] Init success."
     else
         git checkout "$BRANCH" 2>/dev/null || true
     fi
 
-    # --- 还原文件 ---
+    # 还原文件
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
         REMOTE_REL=$(echo "$MAPPING" | cut -d':' -f1)
@@ -109,7 +107,7 @@ backup_data() {
 
 restore_data
 
-# 后台同步循环
+# 后台同步进程
 (
     while true; do
         sleep "$INTERVAL"
@@ -130,29 +128,35 @@ shutdown_handler() {
 }
 trap 'shutdown_handler' SIGTERM SIGINT
 
-# ==================== 4. 智能启动 (显微镜模式) ====================
+# ==================== 4. 智能启动 ====================
 
 echo "[GitWrapper] >>> Starting App..."
-echo "[GitWrapper] [DEBUG] Original Entrypoint: '$ORIGINAL_ENTRYPOINT'"
-echo "[GitWrapper] [DEBUG] Original CMD:        '$ORIGINAL_CMD'"
-echo "[GitWrapper] [DEBUG] Runtime Args:        '$*'"
+echo "[GitWrapper] [DEBUG] WorkDir:    '$ORIGINAL_WORKDIR'"
+echo "[GitWrapper] [DEBUG] Entrypoint: '$ORIGINAL_ENTRYPOINT'"
+echo "[GitWrapper] [DEBUG] CMD:        '$ORIGINAL_CMD'"
+echo "[GitWrapper] [DEBUG] Args:       '$*'"
 
-# --- 拼接命令逻辑 ---
-# 1. 确定参数: 如果用户运行时传了参数($*)，就用用户的；否则用原镜像的CMD
+if [ -n "$ORIGINAL_WORKDIR" ]; then
+    cd "$ORIGINAL_WORKDIR" || cd /
+else
+    cd /
+fi
+
+# --- 拼接逻辑 ---
+# 如果用户运行时传了参数($*)，覆盖原 CMD；否则使用原 CMD
 if [ -n "$*" ]; then
     FINAL_ARGS="$*"
 else
     FINAL_ARGS="$ORIGINAL_CMD"
 fi
 
-# 2. 确定入口: 拼接 Entrypoint 和 参数
+# 拼接 Entrypoint 和 Args
 if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
     CMD_STR="$ORIGINAL_ENTRYPOINT $FINAL_ARGS"
 else
     CMD_STR="$FINAL_ARGS"
 fi
 
-# 3. 防呆检查
 if [ -z "$CMD_STR" ]; then
     echo "[GitWrapper] [FATAL] No command specified! Base image has no ENTRYPOINT and CMD."
     exit 1
@@ -160,7 +164,8 @@ fi
 
 echo "[GitWrapper] [DEBUG] Executing: $CMD_STR"
 
-# 启用作业控制，并将 stderr 重定向到 stdout 以便看到错误日志
+# set -m: 启用作业控制
+# 2>&1: 强制显示错误日志
 set -m
 $CMD_STR 2>&1 &
 APP_PID=$!
