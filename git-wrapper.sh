@@ -2,6 +2,8 @@
 set -e
 
 # ==================== 配置 ====================
+# 约定: 填入干净的 URL (不带 username@)
+# 例如: https://dev.azure.com/org/proj/_git/repo
 REPO_URL="$GW_REPO_URL"
 USERNAME="${GW_USER:-git}" 
 PAT="$GW_PAT"
@@ -9,19 +11,25 @@ BRANCH="${GW_BRANCH:-main}"
 INTERVAL="${GW_INTERVAL:-300}"
 SYNC_MAP="$GW_SYNC_MAP"
 ORIGINAL_ENTRYPOINT="$GW_ORIGINAL_ENTRYPOINT"
+ORIGINAL_CMD="$GW_ORIGINAL_CMD"
 
 GIT_STORE="/git-store"
 
-
+# ==================== 1. URL 构造 ====================
 if [ -z "$REPO_URL" ] || [ -z "$PAT" ] || [ -z "$SYNC_MAP" ]; then
-    echo "[GitWrapper] [ERROR] Missing required env vars."
+    echo "[GitWrapper] [ERROR] Missing required env vars (GW_REPO_URL, GW_PAT, GW_SYNC_MAP)."
 fi
 
-# 只去除开头的 https:// (防止重复)，不做任何其他正则替换
-CLEAN_URL=$(echo "$REPO_URL" | sed "s|^https://||")
-AUTH_URL="https://${USERNAME}:${PAT}@${CLEAN_URL}"
+case "$REPO_URL" in
+    http://*) PROTOCOL="http://" ;;
+    *)        PROTOCOL="https://" ;;
+esac
 
-# ==================== 2. 核心功能 ====================
+CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
+
+AUTH_URL="${PROTOCOL}${USERNAME}:${PAT}@${CLEAN_URL}"
+
+# ==================== 2. 核心函数 ====================
 
 restore_data() {
     echo "[GitWrapper] >>> Initializing..."
@@ -33,13 +41,12 @@ restore_data() {
 
     if [ -d "$GIT_STORE" ]; then rm -rf "$GIT_STORE"; fi
     
-    # Clone 失败也不退出 (可能是空仓库)
-    echo "[GitWrapper] Cloning from: https://${USERNAME}:***@${CLEAN_URL}"
+    # 允许 Clone 失败 (可能是空仓库)
+    echo "[GitWrapper] Cloning repo..."
     git clone "$AUTH_URL" "$GIT_STORE" > /dev/null 2>&1 || true
 
     if [ ! -d "$GIT_STORE/.git" ]; then
-        echo "[GitWrapper] [ERROR] Clone failed. Check your URL/PAT."
-        # 这里为了防止容器无限重启，我们不 exit 1，而是打印错误
+        echo "[GitWrapper] [ERROR] Clone failed. Check URL/PAT."
         return
     fi
 
@@ -47,10 +54,11 @@ restore_data() {
 
     # --- 空仓库自动初始化 ---
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-        echo "[GitWrapper] [WARN] Empty repo. Initializing branch '$BRANCH'..."
+        echo "[GitWrapper] [WARN] Empty repo detected. Initializing branch '$BRANCH'..."
         git checkout -b "$BRANCH" 2>/dev/null || true
-        git commit --allow-empty -m "Init"
+        git commit --allow-empty -m "Init by GitWrapper"
         git push -u origin "$BRANCH"
+        echo "[GitWrapper] [INFO] Init success."
     else
         git checkout "$BRANCH" 2>/dev/null || true
     fi
@@ -74,7 +82,6 @@ restore_data() {
 backup_data() {
     if [ ! -d "$GIT_STORE/.git" ]; then return; fi
     
-    # 简单的两步：同步文件 -> 提交推送
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
         REMOTE_REL=$(echo "$MAPPING" | cut -d':' -f1)
@@ -98,10 +105,11 @@ backup_data() {
     fi
 }
 
-# ==================== 3. 启动逻辑 ====================
+# ==================== 3. 启动流程 ====================
 
 restore_data
 
+# 后台同步循环
 (
     while true; do
         sleep "$INTERVAL"
@@ -122,35 +130,45 @@ shutdown_handler() {
 }
 trap 'shutdown_handler' SIGTERM SIGINT
 
-# ==================== 4. 显微镜 Debug 模式 ====================
+# ==================== 4. 智能启动 (显微镜模式) ====================
 
-echo "[GitWrapper] >>> Starting Main App..."
-echo "[GitWrapper] [DEBUG] Args: $*"
-echo "[GitWrapper] [DEBUG] Original Entrypoint: $ORIGINAL_ENTRYPOINT"
+echo "[GitWrapper] >>> Starting App..."
+echo "[GitWrapper] [DEBUG] Original Entrypoint: '$ORIGINAL_ENTRYPOINT'"
+echo "[GitWrapper] [DEBUG] Original CMD:        '$ORIGINAL_CMD'"
+echo "[GitWrapper] [DEBUG] Runtime Args:        '$*'"
 
-# 拼接命令
-if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-    CMD_STR="$ORIGINAL_ENTRYPOINT $*"
+# --- 拼接命令逻辑 ---
+# 1. 确定参数: 如果用户运行时传了参数($*)，就用用户的；否则用原镜像的CMD
+if [ -n "$*" ]; then
+    FINAL_ARGS="$*"
 else
-    CMD_STR="$*"
+    FINAL_ARGS="$ORIGINAL_CMD"
 fi
 
+# 2. 确定入口: 拼接 Entrypoint 和 参数
+if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+    CMD_STR="$ORIGINAL_ENTRYPOINT $FINAL_ARGS"
+else
+    CMD_STR="$FINAL_ARGS"
+fi
+
+# 3. 防呆检查
 if [ -z "$CMD_STR" ]; then
-    echo "[GitWrapper] [FATAL] No command! Base image has no ENTRYPOINT and CMD is empty."
+    echo "[GitWrapper] [FATAL] No command specified! Base image has no ENTRYPOINT and CMD."
     exit 1
 fi
 
 echo "[GitWrapper] [DEBUG] Executing: $CMD_STR"
 
-# 启用作业控制，防止后台进程被静默回收
+# 启用作业控制，并将 stderr 重定向到 stdout 以便看到错误日志
 set -m
-# 关键：2>&1 确保错误日志能打出来
 $CMD_STR 2>&1 &
 APP_PID=$!
 
 echo "[GitWrapper] [DEBUG] PID: $APP_PID"
 sleep 3
 
+# 存活检测
 if ! kill -0 "$APP_PID" 2>/dev/null; then
     echo "[GitWrapper] [FATAL] App died immediately!"
     wait "$APP_PID"
