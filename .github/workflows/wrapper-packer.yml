@@ -1,14 +1,14 @@
-name: 🏭 Wrap Image (Git Sync)
+name: 🏭 Wrap Image (Auto-Detect)
 
 on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: '原始镜像 (例如: nginx:alpine, mysql:8.0, node:18)'
+        description: 'Base Image (e.g., nginx:alpine, python:3.9)'
         required: true
         default: 'nginx:alpine'
       target_tag:
-        description: '目标镜像名 (例如: nginx-git-sync)'
+        description: 'Target Tag Name'
         required: true
         default: 'app-git-sync'
 
@@ -16,36 +16,37 @@ jobs:
   build-push:
     runs-on: ubuntu-latest
     permissions:
-      packages: write # 允许写入 GHCR
+      packages: write
       contents: read
 
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. 侦探步骤：探测原镜像的 Entrypoint
-      - name: 🕵️ Detect Original Entrypoint
+      # === 关键步骤：双重探测 ===
+      - name: 🕵️ Detect Config
         id: detect
         run: |
-          echo "Inspecting ${{ inputs.base_image }}..."
           docker pull ${{ inputs.base_image }}
           
-          # 提取 Entrypoint 数组并展平为字符串
-          EP=$(docker inspect --format='{{range .Config.Entrypoint}}{{.}} {{end}}' ${{ inputs.base_image }})
-          # 去除尾部空格
-          EP=$(echo "$EP" | sed 's/ *$//')
+          # 抓取 Entrypoint
+          EP=$(docker inspect --format='{{range .Config.Entrypoint}}{{.}} {{end}}' ${{ inputs.base_image }} | sed 's/ *$//')
+          
+          # 抓取 CMD
+          CMD=$(docker inspect --format='{{range .Config.Cmd}}{{.}} {{end}}' ${{ inputs.base_image }} | sed 's/ *$//')
+          
+          echo "entrypoint=$EP" >> $GITHUB_OUTPUT
+          echo "cmd=$CMD" >> $GITHUB_OUTPUT
           
           echo "Detected Entrypoint: [$EP]"
-          echo "entrypoint=$EP" >> $GITHUB_OUTPUT
+          echo "Detected CMD:        [$CMD]"
 
-      # 2. 准备构建环境
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 3. 登录 GHCR
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -53,18 +54,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 4. 构建并推送
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile
           push: true
-          # 双架构支持
           platforms: linux/amd64,linux/arm64
-          # 注入参数
+          # 注入双参数
           build-args: |
             BASE_IMAGE=${{ inputs.base_image }}
             ORIGINAL_ENTRYPOINT=${{ steps.detect.outputs.entrypoint }}
-          # 自动打标签
+            ORIGINAL_CMD=${{ steps.detect.outputs.cmd }}
           tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.target_tag }}:latest
