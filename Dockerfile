@@ -1,17 +1,22 @@
 ARG BASE_IMAGE=alpine:latest
 FROM ${BASE_IMAGE}
 
-# 接收 Action 传来的参数
+# 1. 接收 Entrypoint
 ARG ORIGINAL_ENTRYPOINT=""
 ENV GW_ORIGINAL_ENTRYPOINT=$ORIGINAL_ENTRYPOINT
 
+# 2. 接收 CMD
 ARG ORIGINAL_CMD=""
 ENV GW_ORIGINAL_CMD=$ORIGINAL_CMD
 
-# 强制切回 Root 安装依赖 (防止 Permission Denied)
+# 3. 接收 WorkDir
+ARG ORIGINAL_WORKDIR="/"
+ENV GW_ORIGINAL_WORKDIR=$ORIGINAL_WORKDIR
+
+# 强制切回 Root 以便安装 Git
 USER root
 
-# 智能安装 Git (兼容 Alpine/Debian/CentOS)
+# 智能安装依赖 (兼容 Alpine/Debian/RHEL)
 RUN set -e; \
     if command -v apk > /dev/null; then \
         apk add --no-cache git bash ca-certificates openssh-client; \
@@ -22,7 +27,7 @@ RUN set -e; \
     elif command -v yum > /dev/null; then \
         yum install -y git bash ca-certificates openssh-clients; \
     else \
-        echo "Error: Unsupported package manager."; \
+        echo "Error: Unsupported package manager (distroless?)."; \
         exit 1; \
     fi
 
