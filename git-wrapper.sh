@@ -115,6 +115,8 @@ backup_data() {
 
     # ==================== 🚨 全量截断逻辑 (History Reset) ====================
     COMMIT_COUNT=$(git rev-list --count HEAD)
+
+    echo "[GitWrapper] [RESET] Count $COMMIT_COUNT, $HISTORY_LIMIT."
     
     if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
         echo "[GitWrapper] [RESET] Count $COMMIT_COUNT > $HISTORY_LIMIT. Resetting history to 1 commit..."
