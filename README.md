@@ -25,6 +25,8 @@
 | **GW_SYNC_MAP** | ✅ | `data/conf:/etc/nginx;data/html:/usr/share/nginx/html`<br>格式：`<Git内路径>:<容器内路径>`，多个路径用分号 `;` 隔开 |
 | `GW_BRANCH` | ❌ | `main` (默认分支) |
 | `GW_INTERVAL` | ❌ | `300` (同步间隔，单位秒，默认 5 分钟) |
+| `GW_INTERVAL` | ❌ | `50` 截断数量，方式仓库无限膨胀 |
+
 
 ## ⚙️ 工作原理
 
