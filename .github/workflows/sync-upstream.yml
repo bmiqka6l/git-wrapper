@@ -1,0 +1,41 @@
+name: ⏰ Upstream Sync Scheduler
+
+on:
+  schedule:
+    # 示例：每天凌晨 2:00 (UTC) 触发
+    # 语法是标准的 Cron: 分 时 日 月 周
+    - cron: '0 3 * * *'
+  
+  # 也可以保留手动触发，方便你测试调度器本身
+  workflow_dispatch:
+
+jobs:
+  trigger-updates:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write  # <--- 关键！必须给写权限才能触发其他 Workflow
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # === 任务 1: 同步 Gcli ===
+      - name: Trigger Gcli Wrapper
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用自带 Token 即可
+        run: |
+          gh workflow run wrapper-packer.yml \
+            --ref main \
+            -f base_image=ghcr.io/su-kaka/gcli2api:latest \
+            -f target_tag=gcli2api-git-sync
+
+      # === 任务 2: 同步 Silly ===
+      - name: Trigger Silly Wrapper
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run wrapper-packer.yml \
+            --ref main \
+            -f base_image=ghcr.io/sillytavern/sillytavern:latest \
+            -f target_tag=sillytavern-git-sync
