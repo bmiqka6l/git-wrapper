@@ -2,6 +2,7 @@
 set -e
 
 # ==================== 0. 环境变量 ====================
+# 用户需填入干净的 URL (不带 username@)
 REPO_URL="$GW_REPO_URL"
 USERNAME="${GW_USER:-git}" 
 PAT="$GW_PAT"
@@ -73,6 +74,12 @@ restore_data() {
             mkdir -p "$(dirname "$LOCAL_PATH")"
             rm -rf "$LOCAL_PATH"
             cp -r "$REMOTE_PATH" "$LOCAL_PATH"
+            
+            # === [还原] 脱掉隐身衣 ===
+            # 将 .git_backup_cloak 改回 .git，恢复子项目的 Git 功能
+            if [ -d "$LOCAL_PATH" ]; then
+                find "$LOCAL_PATH" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
+            fi
         fi
     done
 }
@@ -89,7 +96,15 @@ backup_data() {
         if [ -e "$LOCAL_PATH" ]; then
             mkdir -p "$(dirname "$REMOTE_FULL")"
             rm -rf "$REMOTE_FULL"
+            
+            # 拷贝文件
             cp -r "$LOCAL_PATH" "$REMOTE_FULL"
+
+            # === [备份] 穿上隐身衣 ===
+            # 将 .git 改名为 .git_backup_cloak，欺骗父 Git 把它当普通文件夹备份
+            if [ -d "$REMOTE_FULL" ]; then
+                 find "$REMOTE_FULL" -name ".git" -type d -prune -exec mv '{}' '{}_backup_cloak' \; 2>/dev/null || true
+            fi
         fi
     done
 
@@ -128,7 +143,7 @@ shutdown_handler() {
 }
 trap 'shutdown_handler' SIGTERM SIGINT
 
-# ==================== 4. 智能启动 ====================
+# ==================== 4. 智能启动 (显微镜模式) ====================
 
 echo "[GitWrapper] >>> Starting App..."
 echo "[GitWrapper] [DEBUG] WorkDir:    '$ORIGINAL_WORKDIR'"
@@ -136,6 +151,7 @@ echo "[GitWrapper] [DEBUG] Entrypoint: '$ORIGINAL_ENTRYPOINT'"
 echo "[GitWrapper] [DEBUG] CMD:        '$ORIGINAL_CMD'"
 echo "[GitWrapper] [DEBUG] Args:       '$*'"
 
+# --- 切回原目录 ---
 if [ -n "$ORIGINAL_WORKDIR" ]; then
     cd "$ORIGINAL_WORKDIR" || cd /
 else
