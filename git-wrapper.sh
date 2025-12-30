@@ -110,6 +110,7 @@ backup_data() {
         git add .
         git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')" > /dev/null
     else
+        echo "[GitWrapper] Skip Sync"
         return # 无变更不检查截断
     fi
 
