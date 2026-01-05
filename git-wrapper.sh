@@ -22,16 +22,23 @@ ORIGINAL_WORKDIR="$GW_ORIGINAL_WORKDIR"
 GIT_STORE="/git-store"
 
 # ==================== 1. 准备工作 ====================
-if [ -z "$REPO_URL" ] || [ -z "$PAT" ] || [ -z "$SYNC_MAP" ]; then
-    echo "[GitWrapper] [ERROR] Missing env vars."
-fi
+init_config() {
+    if [ -z "$REPO_URL" ] || [ -z "$PAT" ] || [ -z "$SYNC_MAP" ]; then
+        echo "[GitWrapper] [ERROR] Missing required environment variables!"
+        echo "[GitWrapper] [ERROR] Required: GW_REPO_URL, GW_PAT, GW_SYNC_MAP"
+        echo "[GitWrapper] [WARN] Wrapper will start container without sync functionality"
+        return 1
+    fi
 
-case "$REPO_URL" in
-    http://*) PROTOCOL="http://" ;;
-    *)        PROTOCOL="https://" ;;
-esac
-CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
-AUTH_URL="${PROTOCOL}${USERNAME}:${PAT}@${CLEAN_URL}"
+    case "$REPO_URL" in
+        http://*) PROTOCOL="http://" ;;
+        *)        PROTOCOL="https://" ;;
+    esac
+    CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
+    AUTH_URL="${PROTOCOL}${USERNAME}:${PAT}@${CLEAN_URL}"
+    
+    return 0
+}
 
 # ==================== 2. 核心逻辑 ====================
 
@@ -65,18 +72,52 @@ restore_data() {
 
     IFS=';' read -ra MAPPINGS <<< "$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
-        REMOTE_REL=$(echo "$MAPPING" | cut -d':' -f1)
-        REMOTE_PATH="$GIT_STORE/$REMOTE_REL"
-        LOCAL_PATH="$(echo "$MAPPING" | cut -d':' -f2)"
+        # 解析映射
+        IFS=':' read -ra PARTS <<< "$MAPPING"
+        local path_type=""
+        local remote_rel=""
+        local local_path=""
+        
+        if [ ${#PARTS[@]} -eq 3 ]; then
+            # 格式: type:remote_rel:local_path
+            path_type="${PARTS[0]}"
+            remote_rel="${PARTS[1]}"
+            local_path="${PARTS[2]}"
+        elif [ ${#PARTS[@]} -eq 2 ]; then
+            # 格式: remote_rel:local_path (自动判断)
+            remote_rel="${PARTS[0]}"
+            local_path="${PARTS[1]}"
+            # 通过扩展名猜测
+            if [[ "$local_path" =~ \.[a-zA-Z0-9]+$ ]]; then
+                path_type="file"
+            else
+                path_type="dir"
+            fi
+        else
+            echo "[GitWrapper] [ERROR] Invalid SYNC_MAP format: $MAPPING"
+            continue
+        fi
+        
+        REMOTE_PATH="$GIT_STORE/$remote_rel"
 
         if [ -e "$REMOTE_PATH" ]; then
-            echo "[GitWrapper] Restore: $REMOTE_REL -> $LOCAL_PATH"
-            mkdir -p "$(dirname "$LOCAL_PATH")"
-            rm -rf "$LOCAL_PATH"
-            cp -r "$REMOTE_PATH" "$LOCAL_PATH"
+            echo "[GitWrapper] Restore: $remote_rel -> $local_path"
+            mkdir -p "$(dirname "$local_path")"
+            rm -rf "$local_path"
+            cp -r "$REMOTE_PATH" "$local_path"
             # [还原] 脱隐身衣
-            if [ -d "$LOCAL_PATH" ]; then
-                find "$LOCAL_PATH" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
+            if [ -d "$local_path" ]; then
+                find "$local_path" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
+            fi
+        else
+            # Git 仓库中路径不存在（新容器初始化）
+            if [ "$path_type" = "dir" ]; then
+                # 目录类型：预先创建，防止应用写入时报错
+                echo "[GitWrapper] Creating directory for app: $local_path"
+                mkdir -p "$local_path"
+            else
+                # 文件类型：跳过，不创建文件
+                echo "[GitWrapper] Skipping file creation, let app initialize: $local_path"
             fi
         fi
     done
@@ -151,15 +192,23 @@ backup_data() {
 
 # ==================== 3. 启动流程 ====================
 
-restore_data
+if init_config; then
+    # 配置成功，启用同步功能
+    restore_data
 
-(
-    while true; do
-        sleep "$INTERVAL"
-        backup_data
-    done
-) &
-SYNC_PID=$!
+    (
+        while true; do
+            sleep "$INTERVAL"
+            backup_data
+        done
+    ) &
+    SYNC_PID=$!
+else
+    # 配置失败，跳过同步功能
+    echo "[GitWrapper] [WARN] Sync functionality disabled due to configuration error"
+    echo "[GitWrapper] [INFO] Container will start normally without backup/restore"
+    SYNC_PID=""
+fi
 
 shutdown_handler() {
     echo "[GitWrapper] !!! Shutting down..."
@@ -167,8 +216,10 @@ shutdown_handler() {
         kill -SIGTERM "$APP_PID"
         wait "$APP_PID"
     fi
-    kill -SIGTERM "$SYNC_PID" 2>/dev/null
-    backup_data
+    if [ -n "$SYNC_PID" ]; then
+        kill -SIGTERM "$SYNC_PID" 2>/dev/null
+        backup_data
+    fi
     exit 0
 }
 trap 'shutdown_handler' SIGTERM SIGINT
