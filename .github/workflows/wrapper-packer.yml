@@ -40,6 +40,33 @@ jobs:
           # 如果为空，默认为根目录
           if [ -z "$WD" ]; then WD="/"; fi
           
+          # 4. 检测上游镜像支持的平台
+          echo "Detecting available platforms for ${{ inputs.base_image }}..."
+          PLATFORMS=""
+          
+          # 检查 amd64
+          if docker manifest inspect ${{ inputs.base_image }} | grep -q "linux/amd64\|amd64"; then
+            echo "✓ linux/amd64 available"
+            PLATFORMS="linux/amd64"
+          fi
+          
+          # 检查 arm64
+          if docker manifest inspect ${{ inputs.base_image }} | grep -q "linux/arm64\|arm64"; then
+            echo "✓ linux/arm64 available"
+            if [ -n "$PLATFORMS" ]; then
+              PLATFORMS="$PLATFORMS,linux/arm64"
+            else
+              PLATFORMS="linux/arm64"
+            fi
+          fi
+          
+          # 如果都不支持，回退到当前平台
+          if [ -z "$PLATFORMS" ]; then
+            echo "⚠ No common platforms found, using linux/amd64 as fallback"
+            PLATFORMS="linux/amd64"
+          fi
+          
+          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
           echo "entrypoint=$EP" >> $GITHUB_OUTPUT
           echo "cmd=$CMD" >> $GITHUB_OUTPUT
           echo "workdir=$WD" >> $GITHUB_OUTPUT
@@ -48,6 +75,7 @@ jobs:
           echo "Detected Entrypoint: [$EP]"
           echo "Detected CMD:        [$CMD]"
           echo "Detected WorkDir:    [$WD]"
+          echo "Detected Platforms:  [$PLATFORMS]"
           echo "----------------------------------------"
 
       - name: Set up QEMU
@@ -68,7 +96,7 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ steps.detect.outputs.platforms }}
           # === 注入所有探测到的参数 ===
           build-args: |
             BASE_IMAGE=${{ inputs.base_image }}
