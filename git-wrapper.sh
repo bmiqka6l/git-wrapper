@@ -256,7 +256,7 @@ fi
 echo "[GitWrapper] [DEBUG] Executing: $CMD_STR"
 
 set -m
-$CMD_STR 2>&1 &
+eval "$cmd_str" 2>&1 &
 APP_PID=$!
 
 echo "[GitWrapper] [DEBUG] PID: $APP_PID"
