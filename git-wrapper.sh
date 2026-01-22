@@ -255,7 +255,7 @@ fi
 
 echo "[GitWrapper] [DEBUG] Executing: $CMD_STR"
 
-local run_cmd="$cmd_str"
+local run_cmd="$CMD_STR"
 
 case "$run_cmd" in
 "/bin/sh -c "*)
@@ -271,7 +271,7 @@ esac
 
 run_cmd=$(echo "$run_cmd" | sed 's/^[[:space:]]*//')
 
-log_debug "Original CMD: $cmd_str"
+log_debug "Original CMD: $CMD_STR"
 log_debug "Cleaned CMD:  $run_cmd"
 
 set -m
