@@ -34,7 +34,12 @@ init_config() {
     *) PROTOCOL="https://" ;;
     esac
     CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
-    AUTH_URL="${PROTOCOL}${USERNAME}:${PAT}@${CLEAN_URL}"
+    
+    local ENCODED_PAT=$(echo "$PAT" | sed 's/%/%25/g' | sed 's/@/%40/g' | sed 's/:/%3A/g' | sed 's|/|%2F|g' | sed 's/+/%2B/g')
+    
+    local ENCODED_USER=$(echo "$USERNAME" | sed 's/%/%25/g' | sed 's/@/%40/g' | sed 's/:/%3A/g' | sed 's|/|%2F|g' | sed 's/+/%2B/g')
+
+    AUTH_URL="${PROTOCOL}${ENCODED_USER}:${ENCODED_PAT}@${CLEAN_URL}"
 
     return 0
 }
