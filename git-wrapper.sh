@@ -50,22 +50,42 @@ restore_data() {
     git config --global user.email "${USERNAME:-bot}@wrapper.local"
     git config --global init.defaultBranch "$BRANCH"
 
-    # 清理目录
-    if [ -d "$GIT_STORE" ]; then rm -rf "$GIT_STORE"; fi
+    # 1. 暴力清理目录 (带详细日志)
+    if [ -d "$GIT_STORE" ]; then 
+        echo "[GitWrapper] Cleaning existing directory: $GIT_STORE"
+        # 尝试删除
+        rm -rf "$GIT_STORE"
+        
+        # 二次确认：如果还存在，说明删不掉（可能是挂载卷权限问题）
+        if [ -d "$GIT_STORE" ]; then
+             echo "[GitWrapper] [FATAL] Failed to remove existing directory $GIT_STORE."
+             echo "[GitWrapper] [FATAL] This usually happens if $GIT_STORE is a direct volume mount point."
+             echo "[GitWrapper] [FATAL] Git cannot clone into an existing non-empty directory."
+             echo "[GitWrapper] [DEBUG] Directory content:"
+             ls -la "$GIT_STORE"
+             exit 1
+        fi
+    fi
 
-    # ---------------------------------------------------------
-    # 🚨 修复 1: Clone 失败必须直接退出 (Exit 1)
-    # ---------------------------------------------------------
-    echo "[GitWrapper] Cloning repository..."
-    if ! git clone "$AUTH_URL" "$GIT_STORE" >/dev/null 2>&1; then
-        echo "[GitWrapper] [FATAL] Git Clone Failed!"
-        echo "[GitWrapper] [FATAL] Please check REPO_URL, USERNAME, PAT (Token) or Network."
-        echo "[GitWrapper] [FATAL] Container stopping to prevent data loss."
+    # 2. Clone (带详细报错)
+    echo "[GitWrapper] Cloning repository from: $CLEAN_URL" 
+    
+    # 注意：这里去掉了 >/dev/null，只保留 2>&1 或者是直接输出
+    # 为了防止 PAT 泄露太明显，我们尽量只看错误，但为了调试，现在必须看完整输出
+    if ! git clone "$AUTH_URL" "$GIT_STORE"; then
+        echo ""
+        echo "==========================================================="
+        echo "[GitWrapper] [FATAL] Git Clone Failed! (See error above)"
+        echo "==========================================================="
+        echo "Troubleshooting Tips:"
+        echo "1. If error is 'Authentication failed': Check PAT scopes."
+        echo "2. If error is 'URL using bad/illegal format': Your PAT might contain special characters (like @, :) that break the URL."
+        echo "3. If error is 'destination path ... already exists': The cleanup failed."
         exit 1
     fi
 
     if [ ! -d "$GIT_STORE/.git" ]; then
-        echo "[GitWrapper] [FATAL] .git directory missing after clone."
+        echo "[GitWrapper] [FATAL] Clone seemed successful but .git directory is missing."
         exit 1
     fi
 
@@ -113,7 +133,6 @@ restore_data() {
             mkdir -p "$(dirname "$local_path")"
             rm -rf "$local_path"
             cp -r "$REMOTE_PATH" "$local_path"
-            # [还原] 脱隐身衣
             if [ -d "$local_path" ]; then
                 find "$local_path" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
             fi
