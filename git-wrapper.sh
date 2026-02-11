@@ -29,14 +29,17 @@ init_config() {
         return 1
     fi
 
+    # 1. 协议标准化
     case "$REPO_URL" in
     http://*) PROTOCOL="http://" ;;
     *) PROTOCOL="https://" ;;
     esac
     CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
     
+    # 2. PAT URL 编码 (解决 @ : / + 等特殊字符问题)
     local ENCODED_PAT=$(echo "$PAT" | sed 's/%/%25/g' | sed 's/@/%40/g' | sed 's/:/%3A/g' | sed 's|/|%2F|g' | sed 's/+/%2B/g')
     
+    # 3. USERNAME URL 编码
     local ENCODED_USER=$(echo "$USERNAME" | sed 's/%/%25/g' | sed 's/@/%40/g' | sed 's/:/%3A/g' | sed 's|/|%2F|g' | sed 's/+/%2B/g')
 
     AUTH_URL="${PROTOCOL}${ENCODED_USER}:${ENCODED_PAT}@${CLEAN_URL}"
@@ -55,48 +58,49 @@ restore_data() {
     git config --global user.email "${USERNAME:-bot}@wrapper.local"
     git config --global init.defaultBranch "$BRANCH"
 
-    # 1. 暴力清理目录 (带详细日志)
-    if [ -d "$GIT_STORE" ]; then 
-        echo "[GitWrapper] Cleaning existing directory: $GIT_STORE"
-        # 尝试删除
-        rm -rf "$GIT_STORE"
-        
-        # 二次确认：如果还存在，说明删不掉（可能是挂载卷权限问题）
-        if [ -d "$GIT_STORE" ]; then
-             echo "[GitWrapper] [FATAL] Failed to remove existing directory $GIT_STORE."
-             echo "[GitWrapper] [FATAL] This usually happens if $GIT_STORE is a direct volume mount point."
-             echo "[GitWrapper] [FATAL] Git cannot clone into an existing non-empty directory."
-             echo "[GitWrapper] [DEBUG] Directory content:"
-             ls -la "$GIT_STORE"
-             exit 1
-        fi
-    fi
-
-    # 2. Clone (带详细报错)
-    echo "[GitWrapper] Cloning repository from: $CLEAN_URL" 
+    # ========================================================
+    # 阶段 1: Clone 到临时目录 (避免非空目录报错)
+    # ========================================================
     
-    # 注意：这里去掉了 >/dev/null，只保留 2>&1 或者是直接输出
-    # 为了防止 PAT 泄露太明显，我们尽量只看错误，但为了调试，现在必须看完整输出
-    if ! git clone "$AUTH_URL" "$GIT_STORE"; then
-        echo ""
-        echo "==========================================================="
-        echo "[GitWrapper] [FATAL] Git Clone Failed! (See error above)"
-        echo "==========================================================="
-        echo "Troubleshooting Tips:"
-        echo "1. If error is 'Authentication failed': Check PAT scopes."
-        echo "2. If error is 'URL using bad/illegal format': Your PAT might contain special characters (like @, :) that break the URL."
-        echo "3. If error is 'destination path ... already exists': The cleanup failed."
+    local TEMP_CLONE_DIR="/tmp/git-clone-temp-$(date +%s)-$RANDOM"
+    echo "[GitWrapper] Cloning to temporary location..."
+
+    if ! git clone "$AUTH_URL" "$TEMP_CLONE_DIR"; then
+        echo "[GitWrapper] [FATAL] Git Clone Failed!"
+        echo "[GitWrapper] [FATAL] Please check Network or Token validity."
+        rm -rf "$TEMP_CLONE_DIR"
         exit 1
     fi
 
+    # 准备目标目录
+    if [ ! -d "$GIT_STORE" ]; then
+        mkdir -p "$GIT_STORE"
+    else
+        echo "[GitWrapper] Cleaning existing GIT_STORE..."
+        shopt -s dotglob 2>/dev/null || true
+        rm -rf "$GIT_STORE"/*
+        shopt -u dotglob 2>/dev/null || true
+    fi
+
+    # 移动内容
+    echo "[GitWrapper] Moving repository to $GIT_STORE"
+    shopt -s dotglob 2>/dev/null || true
+    if ! mv "$TEMP_CLONE_DIR"/* "$GIT_STORE/"; then
+        echo "[GitWrapper] [FATAL] Failed to move files to $GIT_STORE"
+        rm -rf "$TEMP_CLONE_DIR"
+        exit 1
+    fi
+    shopt -u dotglob 2>/dev/null || true
+    rm -rf "$TEMP_CLONE_DIR"
+
     if [ ! -d "$GIT_STORE/.git" ]; then
-        echo "[GitWrapper] [FATAL] Clone seemed successful but .git directory is missing."
+        echo "[GitWrapper] [FATAL] .git directory missing in $GIT_STORE after move."
         exit 1
     fi
 
     cd "$GIT_STORE"
 
-    # 空仓库初始化逻辑
+    # 空仓库初始化
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
         echo "[GitWrapper] [WARN] Empty repo. Initializing..."
         git checkout -b "$BRANCH" 2>/dev/null || true
@@ -106,7 +110,9 @@ restore_data() {
         git checkout "$BRANCH" 2>/dev/null || true
     fi
 
-    # 还原文件逻辑
+    # ========================================================
+    # 阶段 2: 还原文件 (解决 Resource busy 问题)
+    # ========================================================
     IFS=';' read -ra MAPPINGS <<<"$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
         IFS=':' read -ra PARTS <<<"$MAPPING"
@@ -135,16 +141,48 @@ restore_data() {
 
         if [ -e "$REMOTE_PATH" ]; then
             echo "[GitWrapper] Restore: $remote_rel -> $local_path"
-            mkdir -p "$(dirname "$local_path")"
-            rm -rf "$local_path"
-            cp -r "$REMOTE_PATH" "$local_path"
+            
+            # 确保父目录存在
+            if [ ! -d "$(dirname "$local_path")" ]; then
+                mkdir -p "$(dirname "$local_path")"
+            fi
+
+            # 🚨 核心修复：如果是目录（或挂载卷），清空内容而不是删除目录
+            if [ -d "$local_path" ]; then
+                echo "[GitWrapper] [DEBUG] Target is directory/volume, cleaning contents..."
+                
+                # 开启 dotglob 以删除隐藏文件
+                shopt -s dotglob 2>/dev/null || true
+                
+                # 清空内容 (保留目录外壳)
+                rm -rf "$local_path"/*
+                
+                # 复制内容 (注意结尾斜杠)
+                if [ -d "$REMOTE_PATH" ]; then
+                     cp -r "$REMOTE_PATH"/* "$local_path"/
+                else
+                     # 远程是文件，本地是目录（罕见情况），强制覆盖
+                     cp -r "$REMOTE_PATH" "$local_path"/
+                fi
+                
+                shopt -u dotglob 2>/dev/null || true
+            else
+                # 普通文件或路径不存在，直接覆盖
+                rm -rf "$local_path"
+                cp -r "$REMOTE_PATH" "$local_path"
+            fi
+
+            # [还原] 脱隐身衣
             if [ -d "$local_path" ]; then
                 find "$local_path" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
             fi
         else
+            # Git 中没有此文件/目录
             if [ "$path_type" = "dir" ]; then
-                echo "[GitWrapper] Creating directory for app: $local_path"
-                mkdir -p "$local_path"
+                if [ ! -d "$local_path" ]; then
+                    echo "[GitWrapper] Creating directory for app: $local_path"
+                    mkdir -p "$local_path"
+                fi
             else
                 echo "[GitWrapper] Skipping file creation: $local_path"
             fi
@@ -157,11 +195,8 @@ backup_data() {
 
     IFS=';' read -ra MAPPINGS <<<"$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
-        # 兼容处理
         if [[ "$MAPPING" == *:* ]]; then
-            # 简化逻辑，假设已经是标准化格式或只取后两段
              IFS=':' read -ra PARTS <<<"$MAPPING"
-             # 重新处理分割逻辑，确保兼容 restore 的解析方式
              local remote_rel
              local local_path
              if [ ${#PARTS[@]} -eq 3 ]; then
@@ -229,9 +264,8 @@ shutdown_handler() {
     exit 0
 }
 
-# ==================== 4. 显微镜启动 (封装为函数) ====================
+# ==================== 4. 显微镜启动 ====================
 
-# 🚨 修复 2: 将启动逻辑封装在函数中，解决 local 作用域报错
 start_main_app() {
     echo "[GitWrapper] >>> Starting App..."
     echo "[GitWrapper] [DEBUG] WorkDir:    '$ORIGINAL_WORKDIR'"
@@ -309,7 +343,7 @@ main() {
     trap 'shutdown_handler' SIGTERM SIGINT
 
     if init_config; then
-        # 如果 restore 失败，内部会直接 exit 1，不会执行下面的代码
+        # 如果 restore 失败，内部会直接 exit 1
         restore_data
 
         (
