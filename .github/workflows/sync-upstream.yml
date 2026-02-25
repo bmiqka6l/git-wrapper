@@ -39,3 +39,13 @@ jobs:
             --ref main \
             -f base_image=ghcr.io/sillytavern/sillytavern:latest \
             -f target_tag=sillytavern-git-sync
+            
+      # === 任务 3: 同步 grok ===
+      - name: Trigger Grok Wrapper
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run wrapper-packer.yml \
+            --ref main \
+            -f base_image=ghcr.io/wangxingfan/grok2api:latest \
+            -f target_tag=grok2api-rw-wxf
