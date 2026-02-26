@@ -223,14 +223,14 @@ backup_data() {
         fi
     done
 
-    cd "$GIT_STORE" || return
+    cd "$GIT_STORE" || return 0
 
     if [ -n "$(git status --porcelain)" ]; then
         echo "[GitWrapper] Syncing changes..."
         git add .
         git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null
     else
-        return
+        return 0
     fi
 
     # 截断逻辑
@@ -347,6 +347,7 @@ main() {
         restore_data
 
         (
+            set +e
             while true; do
                 sleep "$INTERVAL"
                 backup_data
