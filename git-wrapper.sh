@@ -191,7 +191,13 @@ restore_data() {
 }
 
 backup_data() {
-    if [ ! -d "$GIT_STORE/.git" ]; then return; fi
+    echo "[GitWrapper] [DEBUG] ========================================"
+    echo "[GitWrapper] [DEBUG] Starting backup cycle at $(date '+%Y-%m-%d %H:%M:%S')"
+
+    if [ ! -d "$GIT_STORE/.git" ]; then 
+        echo "[GitWrapper] [ERROR] .git directory missing in $GIT_STORE. Aborting backup."
+        return 0
+    fi
 
     IFS=';' read -ra MAPPINGS <<<"$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
@@ -213,41 +219,98 @@ backup_data() {
         REMOTE_FULL="$GIT_STORE/$remote_rel"
 
         if [ -e "$local_path" ]; then
+            echo "[GitWrapper] [DEBUG] Copying: $local_path -> $REMOTE_FULL"
             mkdir -p "$(dirname "$REMOTE_FULL")"
             rm -rf "$REMOTE_FULL"
-            cp -r "$local_path" "$REMOTE_FULL"
+            
+            if cp -r "$local_path" "$REMOTE_FULL"; then
+                echo "[GitWrapper] [DEBUG] Copy success."
+            else
+                echo "[GitWrapper] [ERROR] Copy failed for $local_path"
+            fi
+            
             # [备份] 穿隐身衣
             if [ -d "$REMOTE_FULL" ]; then
                 find "$REMOTE_FULL" -name ".git" -type d -prune -exec mv '{}' '{}_backup_cloak' \; 2>/dev/null || true
             fi
+        else
+            echo "[GitWrapper] [WARN] Local path not found, skipping copy: $local_path"
         fi
     done
 
-    cd "$GIT_STORE" || return 0
+    cd "$GIT_STORE" || { echo "[GitWrapper] [ERROR] Failed to enter $GIT_STORE"; return 0; }
 
-    if [ -n "$(git status --porcelain)" ]; then
-        echo "[GitWrapper] Syncing changes..."
+    echo "[GitWrapper] [DEBUG] Checking Git status..."
+    local GIT_STATUS
+    GIT_STATUS=$(git status --porcelain)
+
+    if [ -n "$GIT_STATUS" ]; then
+        echo "[GitWrapper] [INFO] Changes detected:"
+        # 逐行打印发生变化的文件
+        echo "$GIT_STATUS" | while read -r line; do
+            echo "[GitWrapper] [DEBUG]   -> $line"
+        done
+
+        echo "[GitWrapper] [DEBUG] Adding changes to index..."
         git add .
-        git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null
+
+        echo "[GitWrapper] [DEBUG] Committing..."
+        # 移除了 >/dev/null 暴露真实错误
+        if git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')"; then
+            echo "[GitWrapper] [INFO] Commit successful."
+        else
+            echo "[GitWrapper] [ERROR] Commit failed!"
+        fi
     else
+        echo "[GitWrapper] [INFO] No changes detected. Skipping commit and push."
+        echo "[GitWrapper] [DEBUG] ========================================"
         return 0
     fi
 
     # 截断逻辑
-    COMMIT_COUNT=$(git rev-list --count HEAD)
+    COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+    echo "[GitWrapper] [DEBUG] Current commit count: $COMMIT_COUNT / Limit: $HISTORY_LIMIT"
+
     if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
-        echo "[GitWrapper] [RESET] Count $COMMIT_COUNT > $HISTORY_LIMIT. Resetting history..."
+        echo "[GitWrapper] [INFO] Limit reached. Resetting history..."
         CURRENT_BRANCH=$(git branch --show-current)
         git checkout --orphan temp_reset_branch >/dev/null 2>&1
         git add -A
-        git commit -m "Reset History: Snapshot at $(date '+%Y-%m-%d %H:%M:%S')" >/dev/null
-        git branch -D "$CURRENT_BRANCH" >/dev/null 2>&1
+        
+        if git commit -m "Reset History: Snapshot at $(date '+%Y-%m-%d %H:%M:%S')"; then
+            echo "[GitWrapper] [DEBUG] Reset commit created."
+        else
+            echo "[GitWrapper] [ERROR] Reset commit failed."
+        fi
+        
+        git branch -D "$CURRENT_BRANCH" >/dev/null 2>&1 || true
         git branch -m "$CURRENT_BRANCH"
-        git push -f origin "$CURRENT_BRANCH" >/dev/null 2>&1 || echo "[GitWrapper] Force push failed"
+
+        echo "[GitWrapper] [DEBUG] Force pushing to origin..."
+        # 移除了 >/dev/null 2>&1 暴露真实网络/权限错误
+        if git push -f origin "$CURRENT_BRANCH"; then
+            echo "[GitWrapper] [INFO] Force push successful."
+        else
+            echo "[GitWrapper] [ERROR] Force push failed! Check permissions or network."
+        fi
     else
-        git pull --rebase origin "$BRANCH" >/dev/null 2>&1 || true
-        git push origin "$BRANCH" >/dev/null 2>&1
+        echo "[GitWrapper] [DEBUG] Pulling latest from origin (rebase)..."
+        # 暴露 pull 过程中的冲突或报错
+        if ! git pull --rebase origin "$BRANCH"; then
+            echo "[GitWrapper] [WARN] Git pull failed or encountered conflicts!"
+        fi
+
+        echo "[GitWrapper] [DEBUG] Pushing to origin..."
+        # 暴露 push 报错
+        if git push origin "$BRANCH"; then
+            echo "[GitWrapper] [INFO] Push successful."
+        else
+            echo "[GitWrapper] [ERROR] Push failed! Check permissions or network."
+        fi
     fi
+    
+    echo "[GitWrapper] [DEBUG] Backup cycle finished."
+    echo "[GitWrapper] [DEBUG] ========================================"
 }
 
 shutdown_handler() {
