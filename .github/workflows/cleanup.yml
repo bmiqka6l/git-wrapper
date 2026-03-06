@@ -5,10 +5,6 @@ on:
     - cron: "17 2 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   cleanup:
     runs-on: ubuntu-latest
@@ -16,7 +12,7 @@ jobs:
     steps:
       - name: Delete untagged GHCR versions older than 7 days
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
           REPO_FULL: ${{ github.repository }}
           REPO_OWNER: ${{ github.repository_owner }}
         shell: bash
@@ -34,7 +30,6 @@ jobs:
             list_packages_api="/orgs/${REPO_OWNER}/packages?package_type=container&per_page=100"
             versions_api_prefix="/orgs/${REPO_OWNER}/packages/container"
           else
-            # 关键修复：用户命名空间用 authenticated user endpoint
             list_packages_api="/user/packages?package_type=container&per_page=100"
             versions_api_prefix="/user/packages/container"
           fi
@@ -49,7 +44,6 @@ jobs:
               "${list_packages_api}"
           )"
 
-          # 只保留和当前 repo 绑定的包
           mapfile -t packages < <(
             printf '%s\n' "${packages_json}" | jq -r --arg repo "${REPO_FULL}" '
               .[]?
