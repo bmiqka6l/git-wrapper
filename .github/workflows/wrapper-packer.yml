@@ -29,30 +29,29 @@ jobs:
         run: |
           docker pull ${{ inputs.base_image }}
           
-          # 1. 抓取 Entrypoint (数组转字符串)
-          EP=$(docker inspect --format='{{range .Config.Entrypoint}}{{.}} {{end}}' ${{ inputs.base_image }} | sed 's/ *$//')
+          # 1. 抓取原生 JSON 数组
+          EP_JSON=$(docker inspect --format='{{json .Config.Entrypoint}}' ${{ inputs.base_image }})
+          CMD_JSON=$(docker inspect --format='{{json .Config.Cmd}}' ${{ inputs.base_image }})
           
-          # 2. 抓取 CMD (关键：防止 python app.py 丢失)
-          CMD=$(docker inspect --format='{{range .Config.Cmd}}{{.}} {{end}}' ${{ inputs.base_image }} | sed 's/ *$//')
+          # 2. 核心魔法：使用 jq 将 JSON 数组转换为 Bash 安全的强引用字符串！
+          # 例如: ["/opt/my app/run.sh", "--foo"] 会变成 '"/opt/my app/run.sh" "--foo"'
+          # 如果结果是 null，则输出空字符串
+          EP=$(echo "$EP_JSON" | jq -r 'if type=="array" then map(@sh) | join(" ") else "" end')
+          CMD=$(echo "$CMD_JSON" | jq -r 'if type=="array" then map(@sh) | join(" ") else "" end')
           
-          # 3. 抓取 WorkDir (关键：防止路径错误)
+          # 3. 抓取 WorkDir
           WD=$(docker inspect --format='{{.Config.WorkingDir}}' ${{ inputs.base_image }})
-          # 如果为空，默认为根目录
           if [ -z "$WD" ]; then WD="/"; fi
           
           # 4. 检测上游镜像支持的平台
           echo "Detecting available platforms for ${{ inputs.base_image }}..."
           PLATFORMS=""
           
-          # 检查 amd64
           if docker manifest inspect ${{ inputs.base_image }} | grep -q "linux/amd64\|amd64"; then
-            echo "✓ linux/amd64 available"
             PLATFORMS="linux/amd64"
           fi
           
-          # 检查 arm64
           if docker manifest inspect ${{ inputs.base_image }} | grep -q "linux/arm64\|arm64"; then
-            echo "✓ linux/arm64 available"
             if [ -n "$PLATFORMS" ]; then
               PLATFORMS="$PLATFORMS,linux/arm64"
             else
@@ -60,9 +59,7 @@ jobs:
             fi
           fi
           
-          # 如果都不支持，回退到当前平台
           if [ -z "$PLATFORMS" ]; then
-            echo "⚠ No common platforms found, using linux/amd64 as fallback"
             PLATFORMS="linux/amd64"
           fi
           
