@@ -339,50 +339,34 @@ start_main_app() {
         cd /
     fi
 
-    local final_args=""
-    if [ -n "$*" ]; then
-        final_args="$*"
+    local run_cmd=""
+
+    # 1. 核心修复：如果有通过 Wrapper 传入的参数（即原 Docker 的 CMD 数组）
+    if [ $# -gt 0 ]; then
+        # 使用 %q 安全转义所有传入的参数，绝对保留 sh -c 后方命令的完整性与变量占位符
+        printf -v escaped_args "%q " "$@"
+        if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+            run_cmd="$ORIGINAL_ENTRYPOINT $escaped_args"
+        else
+            run_cmd="$escaped_args"
+        fi
     else
-        final_args="$ORIGINAL_CMD"
+        # 2. 如果没有传入参数，降级使用环境变量里的 ORIGINAL_CMD
+        if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+            run_cmd="$ORIGINAL_ENTRYPOINT $ORIGINAL_CMD"
+        else
+            run_cmd="$ORIGINAL_CMD"
+        fi
     fi
 
-    local cmd_str=""
-    if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-        cmd_str="$ORIGINAL_ENTRYPOINT $final_args"
-    else
-        cmd_str="$final_args"
-    fi
-
-    if [ -z "$cmd_str" ]; then
-        echo "[GitWrapper] [FATAL] No command specified!"
-        exit 1
-    fi
-
-    echo "[GitWrapper] [DEBUG] Executing: $cmd_str"
-
-    # 智能剥离 Shell 前缀
-    local run_cmd="$cmd_str"
-    case "$run_cmd" in
-    "/bin/sh -c "*)
-        run_cmd="${run_cmd#/bin/sh -c }"
-        ;;
-    "/bin/bash -c "*)
-        run_cmd="${run_cmd#/bin/bash -c }"
-        ;;
-    "sh -c "*)
-        run_cmd="${run_cmd#sh -c }"
-        ;;
-    esac
-
-    # 去除首部空格
-    run_cmd=$(echo "$run_cmd" | sed 's/^[[:space:]]*//')
-
-    echo "[GitWrapper] [DEBUG] Cleaned CMD:  $run_cmd"
+    echo "[GitWrapper] [DEBUG] Executing: $run_cmd"
 
     set -m
-    # 使用 eval 执行
+    
+    # 移除了之前的 "智能剥离 Shell 前缀" 逻辑，
+    # 因为我们需要保留原生的 sh -c 来让它亲自解析那些 ${SERVER_HOST} 环境变量。
     eval "$run_cmd" 2>&1 &
-    APP_PID=$! # 这里赋值全局变量
+    APP_PID=$!
 
     echo "[GitWrapper] [DEBUG] PID: $APP_PID"
     sleep 3
