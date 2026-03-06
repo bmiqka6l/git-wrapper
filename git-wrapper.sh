@@ -329,71 +329,75 @@ shutdown_handler() {
 
 # ==================== 4. 显微镜启动 ====================
 
+# ==================== 4. 显微镜启动 ====================
+
 start_main_app() {
     echo "[GitWrapper] >>> Starting App..."
-    echo "[GitWrapper] [DEBUG] WorkDir:    '$ORIGINAL_WORKDIR'"
+    echo "[GitWrapper] [DEBUG] -------------------------------------"
+    echo "[GitWrapper] [DEBUG] Raw ORIGINAL_ENTRYPOINT: '$ORIGINAL_ENTRYPOINT'"
+    echo "[GitWrapper] [DEBUG] Raw ORIGINAL_CMD:        '$ORIGINAL_CMD'"
+    echo "[GitWrapper] [DEBUG] Raw ORIGINAL_WORKDIR:    '$ORIGINAL_WORKDIR'"
+    echo "[GitWrapper] [DEBUG] -------------------------------------"
     
     if [ -n "$ORIGINAL_WORKDIR" ]; then
+        echo "[GitWrapper] [DEBUG] Changing directory to: $ORIGINAL_WORKDIR"
         cd "$ORIGINAL_WORKDIR" || cd /
     else
+        echo "[GitWrapper] [DEBUG] No WorkDir specified, using /"
         cd /
     fi
 
     set -m
+    local CMD_ARRAY=()
 
-    if [ $# -gt 0 ]; then
-        # --- 场景 A：Docker 传了参数进来（数组完好） ---
-        echo "[GitWrapper] [DEBUG] Direct arguments detected."
-        local CMD_ARRAY=()
-        if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-            read -r -a EP_ARRAY <<< "$ORIGINAL_ENTRYPOINT"
-            CMD_ARRAY=("${EP_ARRAY[@]}")
-        fi
-        CMD_ARRAY+=("$@")
-
-        "${CMD_ARRAY[@]}" 2>&1 &
-        APP_PID=$!
-    else
-        # --- 场景 B：无参数传入，依赖环境变量里的纯字符串 ---
-        echo "[GitWrapper] [DEBUG] No direct arguments, falling back to string CMD."
-        
-        # 1. 提取真正的原始命令
-        local CLEAN_CMD="$ORIGINAL_CMD"
-        
-        # 2. 核心修复：剥离 sh -c 前缀！
-        # 因为 eval 会帮我们解析环境变量，保留 sh -c 反而会导致参数被截断
-        case "$CLEAN_CMD" in
-            "/bin/sh -c "*) CLEAN_CMD="${CLEAN_CMD#/bin/sh -c }" ;;
-            "/bin/bash -c "*) CLEAN_CMD="${CLEAN_CMD#/bin/bash -c }" ;;
-            "sh -c "*) CLEAN_CMD="${CLEAN_CMD#sh -c }" ;;
-        esac
-
-        # 去除首尾多余空格
-        CLEAN_CMD=$(echo "$CLEAN_CMD" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-
-        local run_cmd=""
-        if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-            run_cmd="$ORIGINAL_ENTRYPOINT $CLEAN_CMD"
-        else
-            run_cmd="$CLEAN_CMD"
-        fi
-        
-        echo "[GitWrapper] [DEBUG] Executing eval: $run_cmd"
-        eval "$run_cmd" 2>&1 &
-        APP_PID=$!
+    # 1. 安全复原 Entrypoint
+    if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+        echo "[GitWrapper] [DEBUG] Restoring Entrypoint array from GHA @sh format..."
+        # eval 配合我们在 GHA 里生成的 @sh 格式，能完美还原带空格的数组
+        eval "EP_ARRAY=($ORIGINAL_ENTRYPOINT)"
+        CMD_ARRAY+=("${EP_ARRAY[@]}")
     fi
 
-    echo "[GitWrapper] [DEBUG] PID: $APP_PID"
+    # 2. 判断是否覆盖了 CMD
+    if [ $# -gt 0 ]; then
+        echo "[GitWrapper] [DEBUG] Direct arguments detected ($# args). Overriding original CMD."
+        CMD_ARRAY+=("$@")
+    elif [ -n "$ORIGINAL_CMD" ]; then
+        echo "[GitWrapper] [DEBUG] No direct arguments. Using original CMD from image."
+        # 安全复原 CMD
+        eval "OCMD_ARRAY=($ORIGINAL_CMD)"
+        CMD_ARRAY+=("${OCMD_ARRAY[@]}")
+    else
+        echo "[GitWrapper] [WARN] No CMD and no arguments provided!"
+    fi
+
+    # 安全校验
+    if [ ${#CMD_ARRAY[@]} -eq 0 ]; then
+        echo "[GitWrapper] [FATAL] Final command array is empty! Cannot start app."
+        exit 1
+    fi
+
+    echo "[GitWrapper] [DEBUG] --- Final Command Execution Array ---"
+    for arg in "${CMD_ARRAY[@]}"; do
+        echo "[GitWrapper] [DEBUG] -> '$arg'"
+    done
+    echo "[GitWrapper] [DEBUG] -------------------------------------"
+
+    # 3. 完美原生地启动应用！
+    "${CMD_ARRAY[@]}" 2>&1 &
+    APP_PID=$!
+
+    echo "[GitWrapper] [DEBUG] App spawned with PID: $APP_PID"
     sleep 3
 
     if ! kill -0 "$APP_PID" 2>/dev/null; then
-        echo "[GitWrapper] [FATAL] App died immediately!"
+        echo "[GitWrapper] [FATAL] App died immediately during startup!"
         wait "$APP_PID"
         local exit_code=$?
         echo "[GitWrapper] [FATAL] Exit Code: $exit_code"
         exit $exit_code
     else
-        echo "[GitWrapper] [SUCCESS] App is running."
+        echo "[GitWrapper] [SUCCESS] App is running stably."
     fi
 
     wait "$APP_PID"
