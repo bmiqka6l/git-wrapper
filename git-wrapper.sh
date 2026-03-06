@@ -341,39 +341,41 @@ start_main_app() {
 
     set -m
 
-    # 声明一个命令数组，用来无损存放参数
-    local CMD_ARRAY=()
-
-    # 1. 安全解析 Entrypoint (支持带空格的 Entrypoint，比如 "dumb-init --")
-    if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-        read -r -a EP_ARRAY <<< "$ORIGINAL_ENTRYPOINT"
-        CMD_ARRAY=("${EP_ARRAY[@]}")
-    fi
-
-    # 2. 核心：如果 Docker 传来了参数（即 CMD ["...", "..."] 数组）
     if [ $# -gt 0 ]; then
-        # 无损追加所有参数到数组中
+        # --- 场景 A：Docker 传了参数进来（数组完好） ---
+        echo "[GitWrapper] [DEBUG] Direct arguments detected."
+        local CMD_ARRAY=()
+        if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+            read -r -a EP_ARRAY <<< "$ORIGINAL_ENTRYPOINT"
+            CMD_ARRAY=("${EP_ARRAY[@]}")
+        fi
         CMD_ARRAY+=("$@")
 
-        echo "[GitWrapper] [DEBUG] --- Command Breakdown ---"
-        # 逐个打印参数，带上单引号，让你亲眼确认边界没丢
-        for arg in "${CMD_ARRAY[@]}"; do
-            echo "[GitWrapper] [DEBUG] Arg: '$arg'"
-        done
-        echo "[GitWrapper] [DEBUG] ---------------------------"
-
-        # 【重点】直接执行数组！不经过任何 eval 转换，完美保留 Docker 原始传参意图
         "${CMD_ARRAY[@]}" 2>&1 &
         APP_PID=$!
-
     else
-        # 3. 降级方案：如果没有传参数，只能硬着头皮 eval 环境变量里的纯字符串
+        # --- 场景 B：无参数传入，依赖环境变量里的纯字符串 ---
         echo "[GitWrapper] [DEBUG] No direct arguments, falling back to string CMD."
+        
+        # 1. 提取真正的原始命令
+        local CLEAN_CMD="$ORIGINAL_CMD"
+        
+        # 2. 核心修复：剥离 sh -c 前缀！
+        # 因为 eval 会帮我们解析环境变量，保留 sh -c 反而会导致参数被截断
+        case "$CLEAN_CMD" in
+            "/bin/sh -c "*) CLEAN_CMD="${CLEAN_CMD#/bin/sh -c }" ;;
+            "/bin/bash -c "*) CLEAN_CMD="${CLEAN_CMD#/bin/bash -c }" ;;
+            "sh -c "*) CLEAN_CMD="${CLEAN_CMD#sh -c }" ;;
+        esac
+
+        # 去除首尾多余空格
+        CLEAN_CMD=$(echo "$CLEAN_CMD" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
         local run_cmd=""
         if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-            run_cmd="$ORIGINAL_ENTRYPOINT $ORIGINAL_CMD"
+            run_cmd="$ORIGINAL_ENTRYPOINT $CLEAN_CMD"
         else
-            run_cmd="$ORIGINAL_CMD"
+            run_cmd="$CLEAN_CMD"
         fi
         
         echo "[GitWrapper] [DEBUG] Executing eval: $run_cmd"
