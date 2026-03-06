@@ -339,34 +339,47 @@ start_main_app() {
         cd /
     fi
 
-    local run_cmd=""
+    set -m
 
-    # 1. 核心修复：如果有通过 Wrapper 传入的参数（即原 Docker 的 CMD 数组）
+    # 声明一个命令数组，用来无损存放参数
+    local CMD_ARRAY=()
+
+    # 1. 安全解析 Entrypoint (支持带空格的 Entrypoint，比如 "dumb-init --")
+    if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
+        read -r -a EP_ARRAY <<< "$ORIGINAL_ENTRYPOINT"
+        CMD_ARRAY=("${EP_ARRAY[@]}")
+    fi
+
+    # 2. 核心：如果 Docker 传来了参数（即 CMD ["...", "..."] 数组）
     if [ $# -gt 0 ]; then
-        # 使用 %q 安全转义所有传入的参数，绝对保留 sh -c 后方命令的完整性与变量占位符
-        printf -v escaped_args "%q " "$@"
-        if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
-            run_cmd="$ORIGINAL_ENTRYPOINT $escaped_args"
-        else
-            run_cmd="$escaped_args"
-        fi
+        # 无损追加所有参数到数组中
+        CMD_ARRAY+=("$@")
+
+        echo "[GitWrapper] [DEBUG] --- Command Breakdown ---"
+        # 逐个打印参数，带上单引号，让你亲眼确认边界没丢
+        for arg in "${CMD_ARRAY[@]}"; do
+            echo "[GitWrapper] [DEBUG] Arg: '$arg'"
+        done
+        echo "[GitWrapper] [DEBUG] ---------------------------"
+
+        # 【重点】直接执行数组！不经过任何 eval 转换，完美保留 Docker 原始传参意图
+        "${CMD_ARRAY[@]}" 2>&1 &
+        APP_PID=$!
+
     else
-        # 2. 如果没有传入参数，降级使用环境变量里的 ORIGINAL_CMD
+        # 3. 降级方案：如果没有传参数，只能硬着头皮 eval 环境变量里的纯字符串
+        echo "[GitWrapper] [DEBUG] No direct arguments, falling back to string CMD."
+        local run_cmd=""
         if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
             run_cmd="$ORIGINAL_ENTRYPOINT $ORIGINAL_CMD"
         else
             run_cmd="$ORIGINAL_CMD"
         fi
+        
+        echo "[GitWrapper] [DEBUG] Executing eval: $run_cmd"
+        eval "$run_cmd" 2>&1 &
+        APP_PID=$!
     fi
-
-    echo "[GitWrapper] [DEBUG] Executing: $run_cmd"
-
-    set -m
-    
-    # 移除了之前的 "智能剥离 Shell 前缀" 逻辑，
-    # 因为我们需要保留原生的 sh -c 来让它亲自解析那些 ${SERVER_HOST} 环境变量。
-    eval "$run_cmd" 2>&1 &
-    APP_PID=$!
 
     echo "[GitWrapper] [DEBUG] PID: $APP_PID"
     sleep 3
