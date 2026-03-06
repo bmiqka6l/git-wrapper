@@ -1,0 +1,100 @@
+name: Cleanup old untagged GHCR versions
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete untagged GHCR versions older than 7 days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cutoff_epoch="$(date -u -d '7 days ago' +%s)"
+          echo "Cutoff: $(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
+
+          owner_type="$(gh api "/users/${REPO_OWNER}" --jq '.type')"
+          if [ "$owner_type" = "Organization" ]; then
+            scope="orgs"
+            list_packages_api="/orgs/${REPO_OWNER}/packages?package_type=container&per_page=100"
+          else
+            scope="users"
+            list_packages_api="/users/${REPO_OWNER}/packages?package_type=container&per_page=100"
+          fi
+
+          echo "Owner type: $owner_type"
+          echo "Repo: $REPO_FULL"
+
+          # 只找和当前 repo 绑定的 GHCR container packages
+          mapfile -t packages < <(
+            gh api --paginate "$list_packages_api" \
+              --jq ".[] | select((.repository.full_name // \"\") == \"${REPO_FULL}\") | .name" \
+              | sort -u
+          )
+
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No GHCR container packages linked to ${REPO_FULL}"
+            exit 0
+          fi
+
+          echo "Packages:"
+          printf ' - %s\n' "${packages[@]}"
+
+          deleted=0
+          kept=0
+          failed=0
+
+          for pkg in "${packages[@]}"; do
+            echo ""
+            echo "=== Package: ${pkg} ==="
+
+            versions_api="/${scope}/${REPO_OWNER}/packages/container/${pkg}/versions?per_page=100"
+
+            while IFS= read -r version_json; do
+              [ -z "$version_json" ] && continue
+
+              version_id="$(jq -r '.id' <<<"$version_json")"
+              created_at="$(jq -r '.created_at' <<<"$version_json")"
+              created_epoch="$(date -u -d "$created_at" +%s)"
+
+              # GHCR container tags
+              tags_count="$(jq -r '(.metadata.container.tags // []) | length' <<<"$version_json")"
+              tags_csv="$(jq -r '(.metadata.container.tags // []) | join(",")' <<<"$version_json")"
+
+              if [ "$tags_count" -eq 0 ] && [ "$created_epoch" -lt "$cutoff_epoch" ]; then
+                echo "Deleting untagged old version: id=$version_id created_at=$created_at"
+
+                delete_api="/${scope}/${REPO_OWNER}/packages/container/${pkg}/versions/${version_id}"
+                if gh api -X DELETE "$delete_api"; then
+                  deleted=$((deleted + 1))
+                else
+                  echo "Failed to delete version $version_id"
+                  failed=$((failed + 1))
+                fi
+              else
+                echo "Keeping version: id=$version_id created_at=$created_at tags=[${tags_csv}]"
+                kept=$((kept + 1))
+              fi
+            done < <(
+              gh api --paginate "$versions_api" --jq '.[]'
+            )
+          done
+
+          echo ""
+          echo "Done"
+          echo "Deleted: $deleted"
+          echo "Kept:    $kept"
+          echo "Failed:  $failed"
