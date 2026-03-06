@@ -1,4 +1,4 @@
-name: 🧹 GHCR: cleanup old untagged images
+name: 🧹 Cleanup old untagged GHCR versions
 
 on:
   schedule:
