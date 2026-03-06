@@ -1,4 +1,4 @@
-name: 🧹 Cleanup old untagged GHCR versions
+name: 🧹 GHCR: cleanup old untagged images
 
 on:
   schedule:
@@ -21,28 +21,41 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
           cutoff_epoch="$(date -u -d '7 days ago' +%s)"
           echo "Cutoff: $(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')"
 
           owner_type="$(gh api "/users/${REPO_OWNER}" --jq '.type')"
-          if [ "$owner_type" = "Organization" ]; then
-            scope="orgs"
+          echo "Owner type: ${owner_type}"
+          echo "Repo: ${REPO_FULL}"
+
+          if [ "${owner_type}" = "Organization" ]; then
             list_packages_api="/orgs/${REPO_OWNER}/packages?package_type=container&per_page=100"
+            versions_api_prefix="/orgs/${REPO_OWNER}/packages/container"
           else
-            scope="users"
-            list_packages_api="/users/${REPO_OWNER}/packages?package_type=container&per_page=100"
+            # 关键修复：用户命名空间用 authenticated user endpoint
+            list_packages_api="/user/packages?package_type=container&per_page=100"
+            versions_api_prefix="/user/packages/container"
           fi
 
-          echo "Owner type: $owner_type"
-          echo "Repo: $REPO_FULL"
+          echo "List API: ${list_packages_api}"
 
-          # 只找和当前 repo 绑定的 GHCR container packages
+          packages_json="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --paginate \
+              "${list_packages_api}"
+          )"
+
+          # 只保留和当前 repo 绑定的包
           mapfile -t packages < <(
-            gh api --paginate "$list_packages_api" \
-              --jq ".[] | select((.repository.full_name // \"\") == \"${REPO_FULL}\") | .name" \
-              | sort -u
+            printf '%s\n' "${packages_json}" | jq -r --arg repo "${REPO_FULL}" '
+              .[]?
+              | select((.repository.full_name // "") == $repo)
+              | .name
+            ' | sort -u
           )
 
           if [ "${#packages[@]}" -eq 0 ]; then
@@ -61,40 +74,47 @@ jobs:
             echo ""
             echo "=== Package: ${pkg} ==="
 
-            versions_api="/${scope}/${REPO_OWNER}/packages/container/${pkg}/versions?per_page=100"
+            versions_json="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                --paginate \
+                "${versions_api_prefix}/${pkg}/versions?per_page=100"
+            )"
 
             while IFS= read -r version_json; do
-              [ -z "$version_json" ] && continue
+              [ -z "${version_json}" ] && continue
 
-              version_id="$(jq -r '.id' <<<"$version_json")"
-              created_at="$(jq -r '.created_at' <<<"$version_json")"
-              created_epoch="$(date -u -d "$created_at" +%s)"
+              version_id="$(jq -r '.id' <<<"${version_json}")"
+              created_at="$(jq -r '.created_at' <<<"${version_json}")"
+              created_epoch="$(date -u -d "${created_at}" +%s)"
 
-              # GHCR container tags
-              tags_count="$(jq -r '(.metadata.container.tags // []) | length' <<<"$version_json")"
-              tags_csv="$(jq -r '(.metadata.container.tags // []) | join(",")' <<<"$version_json")"
+              tags_count="$(jq -r '(.metadata.container.tags // []) | length' <<<"${version_json}")"
+              tags_csv="$(jq -r '(.metadata.container.tags // []) | join(",")' <<<"${version_json}")"
 
-              if [ "$tags_count" -eq 0 ] && [ "$created_epoch" -lt "$cutoff_epoch" ]; then
-                echo "Deleting untagged old version: id=$version_id created_at=$created_at"
+              if [ "${tags_count}" -eq 0 ] && [ "${created_epoch}" -lt "${cutoff_epoch}" ]; then
+                echo "Deleting untagged old version: id=${version_id} created_at=${created_at}"
 
-                delete_api="/${scope}/${REPO_OWNER}/packages/container/${pkg}/versions/${version_id}"
-                if gh api -X DELETE "$delete_api"; then
+                if gh api \
+                  -X DELETE \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "${versions_api_prefix}/${pkg}/versions/${version_id}"
+                then
                   deleted=$((deleted + 1))
                 else
-                  echo "Failed to delete version $version_id"
+                  echo "Failed to delete version ${version_id}"
                   failed=$((failed + 1))
                 fi
               else
-                echo "Keeping version: id=$version_id created_at=$created_at tags=[${tags_csv}]"
+                echo "Keeping version: id=${version_id} created_at=${created_at} tags=[${tags_csv}]"
                 kept=$((kept + 1))
               fi
-            done < <(
-              gh api --paginate "$versions_api" --jq '.[]'
-            )
+            done < <(printf '%s\n' "${versions_json}" | jq -c '.[]?')
           done
 
           echo ""
           echo "Done"
-          echo "Deleted: $deleted"
-          echo "Kept:    $kept"
-          echo "Failed:  $failed"
+          echo "Deleted: ${deleted}"
+          echo "Kept:    ${kept}"
+          echo "Failed:  ${failed}"
