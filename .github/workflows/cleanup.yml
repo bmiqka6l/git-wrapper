@@ -10,7 +10,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Delete untagged GHCR versions older than 7 days
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq skopeo
+
+      - name: Login to GHCR for manifest inspection
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PAT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo "${GH_TOKEN}" | skopeo login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Delete safe old untagged GHCR versions
         env:
           GH_TOKEN: ${{ secrets.GHCR_PAT }}
           REPO_FULL: ${{ github.repository }}
@@ -33,6 +46,10 @@ jobs:
             list_packages_api="/user/packages?package_type=container&per_page=100"
             versions_api_prefix="/user/packages/container"
           fi
+
+          url_encode() {
+            jq -rn --arg v "$1" '$v | @uri'
+          }
 
           echo "List API: ${list_packages_api}"
 
@@ -63,52 +80,151 @@ jobs:
           deleted=0
           kept=0
           failed=0
+          protected=0
+          skipped_packages=0
 
           for pkg in "${packages[@]}"; do
             echo ""
             echo "=== Package: ${pkg} ==="
+
+            pkg_encoded="$(url_encode "${pkg}")"
+            image_ref="ghcr.io/${REPO_OWNER}/${pkg}"
 
             versions_json="$(
               gh api \
                 -H "Accept: application/vnd.github+json" \
                 -H "X-GitHub-Api-Version: 2022-11-28" \
                 --paginate \
-                "${versions_api_prefix}/${pkg}/versions?per_page=100"
+                "${versions_api_prefix}/${pkg_encoded}/versions?per_page=100"
             )"
+
+            protected_file="$(mktemp)"
+            protection_ok=true
+
+            echo "Collecting protected digests from tagged versions..."
+
+            while IFS= read -r version_json; do
+              [ -z "${version_json}" ] && continue
+
+              version_name="$(jq -r '.name // empty' <<<"${version_json}")"
+              tags_count="$(jq -r '(.metadata.container.tags // []) | length' <<<"${version_json}")"
+
+              if [ "${tags_count}" -eq 0 ]; then
+                continue
+              fi
+
+              if [[ "${version_name}" == sha256:* ]]; then
+                echo "${version_name}" >> "${protected_file}"
+              fi
+
+              while IFS= read -r tag; do
+                [ -z "${tag}" ] && continue
+
+                ref="${image_ref}:${tag}"
+                echo "Inspecting tagged ref: ${ref}"
+
+                set +e
+                tag_digest="$(skopeo inspect --format '{{.Digest}}' "docker://${ref}" 2>/tmp/skopeo-digest.err)"
+                status_digest=$?
+
+                raw_manifest="$(skopeo inspect --raw "docker://${ref}" 2>/tmp/skopeo-raw.err)"
+                status_raw=$?
+                set -e
+
+                if [ "${status_digest}" -ne 0 ] || [ "${status_raw}" -ne 0 ]; then
+                  echo "Failed to inspect tagged ref safely: ${ref}" >&2
+                  echo "skopeo digest error:" >&2
+                  cat /tmp/skopeo-digest.err >&2 || true
+                  echo "skopeo raw error:" >&2
+                  cat /tmp/skopeo-raw.err >&2 || true
+                  protection_ok=false
+                  break
+                fi
+
+                if [ -n "${tag_digest}" ]; then
+                  echo "${tag_digest}" >> "${protected_file}"
+                fi
+
+                printf '%s\n' "${raw_manifest}" | jq -r '
+                  .manifests[]?.digest // empty
+                ' >> "${protected_file}"
+
+                printf '%s\n' "${raw_manifest}" | jq -r '
+                  .config.digest // empty
+                ' >> "${protected_file}"
+
+              done < <(
+                jq -r '(.metadata.container.tags // [])[]' <<<"${version_json}"
+              )
+
+              if [ "${protection_ok}" != "true" ]; then
+                break
+              fi
+            done < <(printf '%s\n' "${versions_json}" | jq -c '.[]?')
+
+            sort -u "${protected_file}" -o "${protected_file}"
+
+            protected_count="$(wc -l < "${protected_file}" | tr -d ' ')"
+            echo "Protected digest count: ${protected_count}"
+
+            if [ "${protection_ok}" != "true" ]; then
+              echo "Protection collection failed for package ${pkg}; skip deletions for this package."
+              skipped_packages=$((skipped_packages + 1))
+              rm -f "${protected_file}"
+              continue
+            fi
 
             while IFS= read -r version_json; do
               [ -z "${version_json}" ] && continue
 
               version_id="$(jq -r '.id' <<<"${version_json}")"
+              version_name="$(jq -r '.name // empty' <<<"${version_json}")"
               created_at="$(jq -r '.created_at' <<<"${version_json}")"
               created_epoch="$(date -u -d "${created_at}" +%s)"
 
               tags_count="$(jq -r '(.metadata.container.tags // []) | length' <<<"${version_json}")"
               tags_csv="$(jq -r '(.metadata.container.tags // []) | join(",")' <<<"${version_json}")"
 
-              if [ "${tags_count}" -eq 0 ] && [ "${created_epoch}" -lt "${cutoff_epoch}" ]; then
-                echo "Deleting untagged old version: id=${version_id} created_at=${created_at}"
+              is_protected=false
+              if [ -n "${version_name}" ] && grep -Fxq "${version_name}" "${protected_file}"; then
+                is_protected=true
+              fi
+
+              if [ "${tags_count}" -eq 0 ] \
+                && [ "${created_epoch}" -lt "${cutoff_epoch}" ] \
+                && [ "${is_protected}" != "true" ]; then
+
+                echo "Deleting safe untagged old version: id=${version_id} digest=${version_name} created_at=${created_at}"
 
                 if gh api \
                   -X DELETE \
                   -H "Accept: application/vnd.github+json" \
                   -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "${versions_api_prefix}/${pkg}/versions/${version_id}"
+                  "${versions_api_prefix}/${pkg_encoded}/versions/${version_id}"
                 then
                   deleted=$((deleted + 1))
                 else
                   echo "Failed to delete version ${version_id}"
                   failed=$((failed + 1))
                 fi
+
+              elif [ "${tags_count}" -eq 0 ] && [ "${is_protected}" = "true" ]; then
+                echo "Keeping protected untagged version referenced by tagged manifest: id=${version_id} digest=${version_name} created_at=${created_at}"
+                protected=$((protected + 1))
+
               else
-                echo "Keeping version: id=${version_id} created_at=${created_at} tags=[${tags_csv}]"
+                echo "Keeping version: id=${version_id} digest=${version_name} created_at=${created_at} tags=[${tags_csv}]"
                 kept=$((kept + 1))
               fi
             done < <(printf '%s\n' "${versions_json}" | jq -c '.[]?')
+
+            rm -f "${protected_file}"
           done
 
           echo ""
           echo "Done"
-          echo "Deleted: ${deleted}"
-          echo "Kept:    ${kept}"
-          echo "Failed:  ${failed}"
+          echo "Deleted:          ${deleted}"
+          echo "Kept:             ${kept}"
+          echo "Protected kept:   ${protected}"
+          echo "Failed:           ${failed}"
+          echo "Skipped packages: ${skipped_packages}"
