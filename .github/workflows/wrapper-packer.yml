@@ -15,6 +15,7 @@ on:
 jobs:
   build-push:
     runs-on: ubuntu-latest
+
     permissions:
       packages: write
       contents: read
@@ -23,63 +24,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # === 侦探模式：全量探测原镜像配置 ===
-      - name: 🕵️ Detect Original Config
-        id: detect
+      - name: Install image inspection tools
         run: |
-          docker pull ${{ inputs.base_image }}
-          
-          # 1. 抓取原生 JSON 数组
-          EP_JSON=$(docker inspect --format='{{json .Config.Entrypoint}}' ${{ inputs.base_image }})
-          CMD_JSON=$(docker inspect --format='{{json .Config.Cmd}}' ${{ inputs.base_image }})
-          
-          # 2. 核心魔法：使用 jq 将 JSON 数组转换为 Bash 安全的强引用字符串！
-          # 例如: ["/opt/my app/run.sh", "--foo"] 会变成 '"/opt/my app/run.sh" "--foo"'
-          # 如果结果是 null，则输出空字符串
-          EP=$(echo "$EP_JSON" | jq -r 'if type=="array" then map(@sh) | join(" ") else "" end')
-          CMD=$(echo "$CMD_JSON" | jq -r 'if type=="array" then map(@sh) | join(" ") else "" end')
-          
-          # 3. 抓取 WorkDir
-          WD=$(docker inspect --format='{{.Config.WorkingDir}}' ${{ inputs.base_image }})
-          if [ -z "$WD" ]; then WD="/"; fi
-          
-          # 4. 检测上游镜像支持的平台
-          echo "Detecting available platforms for ${{ inputs.base_image }}..."
-          PLATFORMS=""
-          
-          if docker manifest inspect ${{ inputs.base_image }} | grep -q "linux/amd64\|amd64"; then
-            PLATFORMS="linux/amd64"
-          fi
-          
-          if docker manifest inspect ${{ inputs.base_image }} | grep -q "linux/arm64\|arm64"; then
-            if [ -n "$PLATFORMS" ]; then
-              PLATFORMS="$PLATFORMS,linux/arm64"
-            else
-              PLATFORMS="linux/arm64"
-            fi
-          fi
-          
-          if [ -z "$PLATFORMS" ]; then
-            PLATFORMS="linux/amd64"
-          fi
-          
-          echo "platforms=$PLATFORMS" >> $GITHUB_OUTPUT
-          echo "entrypoint=$EP" >> $GITHUB_OUTPUT
-          echo "cmd=$CMD" >> $GITHUB_OUTPUT
-          echo "workdir=$WD" >> $GITHUB_OUTPUT
-          
-          echo "----------------------------------------"
-          echo "Detected Entrypoint: [$EP]"
-          echo "Detected CMD:        [$CMD]"
-          echo "Detected WorkDir:    [$WD]"
-          echo "Detected Platforms:  [$PLATFORMS]"
-          echo "----------------------------------------"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          sudo apt-get update
+          sudo apt-get install -y skopeo jq
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -88,16 +36,144 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # === 侦探模式：探测原镜像配置 + 判断是否已经构建过 ===
+      - name: 🕵️ Detect Original Config
+        id: detect
+        shell: bash
+        env:
+          BASE_IMAGE: ${{ inputs.base_image }}
+          TARGET_IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.target_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Inspecting upstream digest for ${BASE_IMAGE}..."
+
+          UPSTREAM_DIGEST="$(
+            skopeo inspect --format '{{.Digest}}' "docker://${BASE_IMAGE}"
+          )"
+
+          if [ -z "$UPSTREAM_DIGEST" ]; then
+            echo "Failed to resolve upstream digest: ${BASE_IMAGE}" >&2
+            exit 1
+          fi
+
+          DIGEST_SHORT="${UPSTREAM_DIGEST#sha256:}"
+          DIGEST_SHORT="${DIGEST_SHORT:0:12}"
+
+          MARKER_TAG="upstream-${DIGEST_SHORT}"
+          MARKER_IMAGE="${TARGET_IMAGE}:${MARKER_TAG}"
+
+          echo "Checking marker image: ${MARKER_IMAGE}"
+
+          MARKER_EXISTS=false
+          if skopeo inspect \
+            --creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" \
+            "docker://${MARKER_IMAGE}" >/dev/null 2>&1; then
+            MARKER_EXISTS=true
+          fi
+
+          SHOULD_BUILD=true
+          if [ "$MARKER_EXISTS" = "true" ]; then
+            SHOULD_BUILD=false
+          fi
+
+          docker pull "${BASE_IMAGE}"
+
+          # 1. 抓取原生 JSON 数组
+          EP_JSON="$(docker inspect --format='{{json .Config.Entrypoint}}' "${BASE_IMAGE}")"
+          CMD_JSON="$(docker inspect --format='{{json .Config.Cmd}}' "${BASE_IMAGE}")"
+
+          # 2. 使用 jq 将 JSON 数组转换为 Bash 安全的强引用字符串
+          EP="$(echo "$EP_JSON" | jq -r 'if type=="array" then map(@sh) | join(" ") else "" end')"
+          CMD="$(echo "$CMD_JSON" | jq -r 'if type=="array" then map(@sh) | join(" ") else "" end')"
+
+          # 3. 抓取 WorkDir
+          WD="$(docker inspect --format='{{.Config.WorkingDir}}' "${BASE_IMAGE}")"
+          if [ -z "$WD" ]; then
+            WD="/"
+          fi
+
+          # 4. 检测上游镜像支持的平台
+          echo "Detecting available platforms for ${BASE_IMAGE}..."
+
+          RAW_MANIFEST="$(skopeo inspect --raw "docker://${BASE_IMAGE}")"
+
+          PLATFORMS="$(
+            echo "$RAW_MANIFEST" \
+              | jq -r '
+                  if .manifests then
+                    .manifests[]
+                    | select(.platform.os == "linux")
+                    | select(.platform.architecture == "amd64" or .platform.architecture == "arm64")
+                    | "linux/" + .platform.architecture
+                  else
+                    empty
+                  end
+                ' \
+              | sort -u \
+              | paste -sd, -
+          )"
+
+          if [ -z "$PLATFORMS" ]; then
+            ARCH="$(skopeo inspect --format '{{.Architecture}}' "docker://${BASE_IMAGE}")"
+            OS="$(skopeo inspect --format '{{.Os}}' "docker://${BASE_IMAGE}")"
+
+            if [ "$OS" = "linux" ] && { [ "$ARCH" = "amd64" ] || [ "$ARCH" = "arm64" ]; }; then
+              PLATFORMS="linux/${ARCH}"
+            else
+              PLATFORMS="linux/amd64"
+            fi
+          fi
+
+          echo "platforms=${PLATFORMS}" >> "$GITHUB_OUTPUT"
+          echo "entrypoint=${EP}" >> "$GITHUB_OUTPUT"
+          echo "cmd=${CMD}" >> "$GITHUB_OUTPUT"
+          echo "workdir=${WD}" >> "$GITHUB_OUTPUT"
+          echo "upstream_digest=${UPSTREAM_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "digest_short=${DIGEST_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "marker_tag=${MARKER_TAG}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+
+          echo "----------------------------------------"
+          echo "Base Image:          ${BASE_IMAGE}"
+          echo "Target Image:        ${TARGET_IMAGE}"
+          echo "Upstream Digest:     ${UPSTREAM_DIGEST}"
+          echo "Marker Image:        ${MARKER_IMAGE}"
+          echo "Marker Exists:       ${MARKER_EXISTS}"
+          echo "Should Build:        ${SHOULD_BUILD}"
+          echo "Detected Entrypoint: [${EP}]"
+          echo "Detected CMD:        [${CMD}]"
+          echo "Detected WorkDir:    [${WD}]"
+          echo "Detected Platforms:  [${PLATFORMS}]"
+          echo "----------------------------------------"
+
+      - name: Skip build
+        if: steps.detect.outputs.should_build != 'true'
+        run: |
+          echo "This upstream image has already been wrapped."
+          echo "Marker tag: ${{ steps.detect.outputs.marker_tag }}"
+
+      - name: Set up QEMU
+        if: steps.detect.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.detect.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and Push
+        if: steps.detect.outputs.should_build == 'true'
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: ${{ steps.detect.outputs.platforms }}
-          # === 注入所有探测到的参数 ===
           build-args: |
-            BASE_IMAGE=${{ inputs.base_image }}
+            BASE_IMAGE=${{ inputs.base_image }}@${{ steps.detect.outputs.upstream_digest }}
             ORIGINAL_ENTRYPOINT=${{ steps.detect.outputs.entrypoint }}
             ORIGINAL_CMD=${{ steps.detect.outputs.cmd }}
             ORIGINAL_WORKDIR=${{ steps.detect.outputs.workdir }}
-          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.target_tag }}:latest
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.target_tag }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.target_tag }}:${{ steps.detect.outputs.marker_tag }}
