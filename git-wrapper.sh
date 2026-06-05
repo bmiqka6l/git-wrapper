@@ -8,6 +8,7 @@ PAT="$GW_PAT"
 BRANCH="${GW_BRANCH:-main}"
 INTERVAL="${GW_INTERVAL:-300}"
 SYNC_MAP="$GW_SYNC_MAP"
+IGNORE_RULES="${GW_IGNORE:-*.log}" # 新增：忽略规则
 
 # === 截断配置 ===
 HISTORY_LIMIT="${GW_HISTORY_LIMIT:-50}"
@@ -100,11 +101,24 @@ restore_data() {
 
     cd "$GIT_STORE"
 
+    # ========================================================
+    # 阶段 1.5: 写入 .gitignore 规则
+    # ========================================================
+    echo "[GitWrapper] [DEBUG] Applying .gitignore rules: $IGNORE_RULES"
+    > .gitignore # 清空或创建
+    IFS=';' read -ra IGNS <<< "$IGNORE_RULES"
+    for ign in "${IGNS[@]}"; do
+        if [ -n "$ign" ]; then
+            echo "$ign" >> .gitignore
+        fi
+    done
+
     # 空仓库初始化
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
         echo "[GitWrapper] [WARN] Empty repo. Initializing..."
         git checkout -b "$BRANCH" 2>/dev/null || true
-        git commit --allow-empty -m "Init"
+        git add .gitignore
+        git commit -m "Init with .gitignore"
         git push -u origin "$BRANCH"
     else
         git checkout "$BRANCH" 2>/dev/null || true
@@ -199,6 +213,16 @@ backup_data() {
         return 0
     fi
 
+    # ========================================================
+    # 🚨 终极防线 1：暴力砸碎历史遗留的 Rebase 锁并退出游离态
+    # ========================================================
+    if [ -d "$GIT_STORE/.git/rebase-merge" ] || [ -d "$GIT_STORE/.git/rebase-apply" ]; then
+        echo "[GitWrapper] [WARN] Stale rebase state detected. Smashing the lock..."
+        git rebase --abort >/dev/null 2>&1 || rm -rf "$GIT_STORE/.git/rebase-merge" "$GIT_STORE/.git/rebase-apply"
+        # 强制切回主分支，防止身处 Detached HEAD 状态
+        git checkout -f "$BRANCH" >/dev/null 2>&1 || true
+    fi
+
     IFS=';' read -ra MAPPINGS <<<"$SYNC_MAP"
     for MAPPING in "${MAPPINGS[@]}"; do
         if [[ "$MAPPING" == *:* ]]; then
@@ -246,7 +270,6 @@ backup_data() {
 
     if [ -n "$GIT_STATUS" ]; then
         echo "[GitWrapper] [INFO] Changes detected:"
-        # 逐行打印发生变化的文件
         echo "$GIT_STATUS" | while read -r line; do
             echo "[GitWrapper] [DEBUG]   -> $line"
         done
@@ -255,7 +278,6 @@ backup_data() {
         git add .
 
         echo "[GitWrapper] [DEBUG] Committing..."
-        # 移除了 >/dev/null 暴露真实错误
         if git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')"; then
             echo "[GitWrapper] [INFO] Commit successful."
         else
@@ -273,7 +295,7 @@ backup_data() {
 
     if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
         echo "[GitWrapper] [INFO] Limit reached. Resetting history..."
-        CURRENT_BRANCH=$(git branch --show-current)
+        
         git checkout --orphan temp_reset_branch >/dev/null 2>&1
         git add -A
         
@@ -283,25 +305,30 @@ backup_data() {
             echo "[GitWrapper] [ERROR] Reset commit failed."
         fi
         
-        git branch -D "$CURRENT_BRANCH" >/dev/null 2>&1 || true
-        git branch -m "$CURRENT_BRANCH"
+        git branch -D "$BRANCH" >/dev/null 2>&1 || true
+        git branch -m "$BRANCH"
 
         echo "[GitWrapper] [DEBUG] Force pushing to origin..."
-        # 移除了 >/dev/null 2>&1 暴露真实网络/权限错误
-        if git push -f origin "$CURRENT_BRANCH"; then
+        if git push -f origin "$BRANCH"; then
             echo "[GitWrapper] [INFO] Force push successful."
         else
-            echo "[GitWrapper] [ERROR] Force push failed! Check permissions or network."
+            echo "[GitWrapper] [ERROR] Force push failed! (Check GitLab Protected Branch settings)"
+            # ========================================================
+            # 🚨 终极防线 2：战败回滚！如果强推失败，立刻重置本地代码，保持与远程同频
+            # ========================================================
+            echo "[GitWrapper] [INFO] Rolling back local history to match remote and prevent chain-reaction conflicts..."
+            git fetch origin "$BRANCH" >/dev/null 2>&1 || true
+            git reset --hard "origin/$BRANCH" >/dev/null 2>&1 || true
         fi
     else
         echo "[GitWrapper] [DEBUG] Pulling latest from origin (rebase)..."
-        # 暴露 pull 过程中的冲突或报错
         if ! git pull --rebase origin "$BRANCH"; then
             echo "[GitWrapper] [WARN] Git pull failed or encountered conflicts!"
+            # 🚨 终极防线 3：拉取冲突立刻终止，绝不挂起
+            git rebase --abort >/dev/null 2>&1 || true
         fi
 
         echo "[GitWrapper] [DEBUG] Pushing to origin..."
-        # 暴露 push 报错
         if git push origin "$BRANCH"; then
             echo "[GitWrapper] [INFO] Push successful."
         else
@@ -329,8 +356,6 @@ shutdown_handler() {
 
 # ==================== 4. 显微镜启动 ====================
 
-# ==================== 4. 显微镜启动 ====================
-
 start_main_app() {
     echo "[GitWrapper] >>> Starting App..."
     echo "[GitWrapper] [DEBUG] -------------------------------------"
@@ -353,7 +378,6 @@ start_main_app() {
     # 1. 安全复原 Entrypoint
     if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
         echo "[GitWrapper] [DEBUG] Restoring Entrypoint array from GHA @sh format..."
-        # eval 配合我们在 GHA 里生成的 @sh 格式，能完美还原带空格的数组
         eval "EP_ARRAY=($ORIGINAL_ENTRYPOINT)"
         CMD_ARRAY+=("${EP_ARRAY[@]}")
     fi
@@ -364,7 +388,6 @@ start_main_app() {
         CMD_ARRAY+=("$@")
     elif [ -n "$ORIGINAL_CMD" ]; then
         echo "[GitWrapper] [DEBUG] No direct arguments. Using original CMD from image."
-        # 安全复原 CMD
         eval "OCMD_ARRAY=($ORIGINAL_CMD)"
         CMD_ARRAY+=("${OCMD_ARRAY[@]}")
     else
