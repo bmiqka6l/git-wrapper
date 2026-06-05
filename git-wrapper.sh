@@ -8,7 +8,7 @@ PAT="$GW_PAT"
 BRANCH="${GW_BRANCH:-main}"
 INTERVAL="${GW_INTERVAL:-300}"
 SYNC_MAP="$GW_SYNC_MAP"
-IGNORE_RULES="${GW_IGNORE:-*.log}" # 新增：忽略规则
+IGNORE_RULES="${GW_IGNORE:-*.log}" # 忽略规则
 
 # === 截断配置 ===
 HISTORY_LIMIT="${GW_HISTORY_LIMIT:-50}"
@@ -113,15 +113,23 @@ restore_data() {
         fi
     done
 
-    # 空仓库初始化
+    # ========================================================
+    # 🚨 修复 1: Checkout 失败时立刻熔断，防止脏环境运行
+    # ========================================================
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
         echo "[GitWrapper] [WARN] Empty repo. Initializing..."
-        git checkout -b "$BRANCH" 2>/dev/null || true
+        git checkout -b "$BRANCH" 2>/dev/null || {
+            echo "[GitWrapper] [FATAL] Failed to create branch: $BRANCH"
+            exit 1
+        }
         git add .gitignore
         git commit -m "Init with .gitignore"
         git push -u origin "$BRANCH"
     else
-        git checkout "$BRANCH" 2>/dev/null || true
+        git checkout "$BRANCH" 2>/dev/null || {
+            echo "[GitWrapper] [FATAL] Failed to checkout branch: $BRANCH"
+            exit 1
+        }
     fi
 
     # ========================================================
@@ -156,29 +164,20 @@ restore_data() {
         if [ -e "$REMOTE_PATH" ]; then
             echo "[GitWrapper] Restore: $remote_rel -> $local_path"
             
-            # 确保父目录存在
             if [ ! -d "$(dirname "$local_path")" ]; then
                 mkdir -p "$(dirname "$local_path")"
             fi
 
-            # 🚨 核心修复：如果是目录（或挂载卷），清空内容而不是删除目录
+            # 如果是目录（或挂载卷），清空内容而不是删除目录
             if [ -d "$local_path" ]; then
                 echo "[GitWrapper] [DEBUG] Target is directory/volume, cleaning contents..."
-                
-                # 开启 dotglob 以删除隐藏文件
                 shopt -s dotglob 2>/dev/null || true
-                
-                # 清空内容 (保留目录外壳)
                 rm -rf "$local_path"/*
-                
-                # 复制内容 (注意结尾斜杠)
                 if [ -d "$REMOTE_PATH" ]; then
                      cp -r "$REMOTE_PATH"/* "$local_path"/
                 else
-                     # 远程是文件，本地是目录（罕见情况），强制覆盖
                      cp -r "$REMOTE_PATH" "$local_path"/
                 fi
-                
                 shopt -u dotglob 2>/dev/null || true
             else
                 # 普通文件或路径不存在，直接覆盖
@@ -191,7 +190,6 @@ restore_data() {
                 find "$local_path" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
             fi
         else
-            # Git 中没有此文件/目录
             if [ "$path_type" = "dir" ]; then
                 if [ ! -d "$local_path" ]; then
                     echo "[GitWrapper] Creating directory for app: $local_path"
@@ -213,13 +211,10 @@ backup_data() {
         return 0
     fi
 
-    # ========================================================
-    # 🚨 终极防线 1：暴力砸碎历史遗留的 Rebase 锁并退出游离态
-    # ========================================================
+    # 砸碎历史遗留的 Rebase 锁并退出游离态
     if [ -d "$GIT_STORE/.git/rebase-merge" ] || [ -d "$GIT_STORE/.git/rebase-apply" ]; then
         echo "[GitWrapper] [WARN] Stale rebase state detected. Smashing the lock..."
         git rebase --abort >/dev/null 2>&1 || rm -rf "$GIT_STORE/.git/rebase-merge" "$GIT_STORE/.git/rebase-apply"
-        # 强制切回主分支，防止身处 Detached HEAD 状态
         git checkout -f "$BRANCH" >/dev/null 2>&1 || true
     fi
 
@@ -253,7 +248,6 @@ backup_data() {
                 echo "[GitWrapper] [ERROR] Copy failed for $local_path"
             fi
             
-            # [备份] 穿隐身衣
             if [ -d "$REMOTE_FULL" ]; then
                 find "$REMOTE_FULL" -name ".git" -type d -prune -exec mv '{}' '{}_backup_cloak' \; 2>/dev/null || true
             fi
@@ -282,6 +276,7 @@ backup_data() {
             echo "[GitWrapper] [INFO] Commit successful."
         else
             echo "[GitWrapper] [ERROR] Commit failed!"
+            return 0
         fi
     else
         echo "[GitWrapper] [INFO] No changes detected. Skipping commit and push."
@@ -289,51 +284,76 @@ backup_data() {
         return 0
     fi
 
-    # 截断逻辑
     COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo 0)
     echo "[GitWrapper] [DEBUG] Current commit count: $COMMIT_COUNT / Limit: $HISTORY_LIMIT"
 
-    if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
-        echo "[GitWrapper] [INFO] Limit reached. Resetting history..."
-        
-        git checkout --orphan temp_reset_branch >/dev/null 2>&1
-        git add -A
-        
-        if git commit -m "Reset History: Snapshot at $(date '+%Y-%m-%d %H:%M:%S')"; then
-            echo "[GitWrapper] [DEBUG] Reset commit created."
-        else
-            echo "[GitWrapper] [ERROR] Reset commit failed."
-        fi
-        
-        git branch -D "$BRANCH" >/dev/null 2>&1 || true
-        git branch -m "$BRANCH"
-
-        echo "[GitWrapper] [DEBUG] Force pushing to origin..."
-        if git push -f origin "$BRANCH"; then
-            echo "[GitWrapper] [INFO] Force push successful."
-        else
-            echo "[GitWrapper] [ERROR] Force push failed! (Check GitLab Protected Branch settings)"
-            # ========================================================
-            # 🚨 终极防线 2：战败回滚！如果强推失败，立刻重置本地代码，保持与远程同频
-            # ========================================================
-            echo "[GitWrapper] [INFO] Rolling back local history to match remote and prevent chain-reaction conflicts..."
-            git fetch origin "$BRANCH" >/dev/null 2>&1 || true
-            git reset --hard "origin/$BRANCH" >/dev/null 2>&1 || true
-        fi
-    else
+    # ========================================================
+    # 🚨 修复 2: 将推送逻辑拆分为 truncate_history 和 normal_push
+    # ========================================================
+    
+    normal_push() {
         echo "[GitWrapper] [DEBUG] Pulling latest from origin (rebase)..."
         if ! git pull --rebase origin "$BRANCH"; then
             echo "[GitWrapper] [WARN] Git pull failed or encountered conflicts!"
-            # 🚨 终极防线 3：拉取冲突立刻终止，绝不挂起
+            echo "[GitWrapper] [DEBUG] Aborting rebase to prevent directory lock..."
             git rebase --abort >/dev/null 2>&1 || true
+            return 1
         fi
 
         echo "[GitWrapper] [DEBUG] Pushing to origin..."
         if git push origin "$BRANCH"; then
             echo "[GitWrapper] [INFO] Push successful."
+            return 0
         else
             echo "[GitWrapper] [ERROR] Push failed! Check permissions or network."
+            return 1
         fi
+    }
+
+    truncate_history() {
+        local original_ref
+        original_ref="$(git rev-parse HEAD)" || return 1
+
+        echo "[GitWrapper] [INFO] History limit reached. Try truncation."
+
+        if ! git checkout --orphan temp_reset_branch >/dev/null 2>&1; then
+            echo "[GitWrapper] [WARN] Failed to create orphan branch. Fallback to normal push."
+            git checkout -f "$BRANCH" >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        git add -A
+        if ! git commit -m "Reset History: Snapshot at $(date '+%Y-%m-%d %H:%M:%S')"; then
+            echo "[GitWrapper] [WARN] Failed to create reset commit. Fallback to normal push."
+            git checkout -f "$BRANCH" >/dev/null 2>&1 || true
+            return 1
+        fi
+
+        git branch -D "$BRANCH" >/dev/null 2>&1 || true
+        git branch -m "$BRANCH"
+
+        echo "[GitWrapper] [DEBUG] Force pushing to origin..."
+        if git push -f origin "$BRANCH"; then
+            echo "[GitWrapper] [INFO] History truncation completed successfully."
+            return 0
+        fi
+
+        echo "[GitWrapper] [WARN] Force push failed! (Check protected branch settings). Fallback to normal push."
+        echo "[GitWrapper] [INFO] Rolling back to original backup commit..."
+
+        if ! git checkout -B "$BRANCH" "$original_ref" >/dev/null 2>&1; then
+            echo "[GitWrapper] [ERROR] Failed to restore original commit after truncation failure."
+            return 1
+        fi
+
+        return 1
+    }
+
+    # 执行决策
+    if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
+        truncate_history || normal_push
+    else
+        normal_push
     fi
     
     echo "[GitWrapper] [DEBUG] Backup cycle finished."
