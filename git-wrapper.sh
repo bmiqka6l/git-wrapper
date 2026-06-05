@@ -37,7 +37,7 @@ init_config() {
     esac
     CLEAN_URL=$(echo "$REPO_URL" | sed -E "s|^(https?://)||")
     
-    # 2. PAT URL 编码 (解决 @ : / + 等特殊字符问题)
+    # 2. PAT URL 编码
     local ENCODED_PAT=$(echo "$PAT" | sed 's/%/%25/g' | sed 's/@/%40/g' | sed 's/:/%3A/g' | sed 's|/|%2F|g' | sed 's/+/%2B/g')
     
     # 3. USERNAME URL 编码
@@ -60,9 +60,8 @@ restore_data() {
     git config --global init.defaultBranch "$BRANCH"
 
     # ========================================================
-    # 阶段 1: Clone 到临时目录 (避免非空目录报错)
+    # 阶段 1: Clone 到临时目录
     # ========================================================
-    
     local TEMP_CLONE_DIR="/tmp/git-clone-temp-$(date +%s)-$RANDOM"
     echo "[GitWrapper] Cloning to temporary location..."
 
@@ -73,7 +72,6 @@ restore_data() {
         exit 1
     fi
 
-    # 准备目标目录
     if [ ! -d "$GIT_STORE" ]; then
         mkdir -p "$GIT_STORE"
     else
@@ -83,7 +81,6 @@ restore_data() {
         shopt -u dotglob 2>/dev/null || true
     fi
 
-    # 移动内容
     echo "[GitWrapper] Moving repository to $GIT_STORE"
     shopt -s dotglob 2>/dev/null || true
     if ! mv "$TEMP_CLONE_DIR"/* "$GIT_STORE/"; then
@@ -102,34 +99,37 @@ restore_data() {
     cd "$GIT_STORE"
 
     # ========================================================
-    # 阶段 1.5: 写入 .gitignore 规则
+    # 🚨 修复 1: 先确保切到正确的环境与分支，再写入工作区文件
     # ========================================================
-    echo "[GitWrapper] [DEBUG] Applying .gitignore rules: $IGNORE_RULES"
-    > .gitignore # 清空或创建
-    IFS=';' read -ra IGNS <<< "$IGNORE_RULES"
-    for ign in "${IGNS[@]}"; do
-        if [ -n "$ign" ]; then
-            echo "$ign" >> .gitignore
-        fi
-    done
-
-    # ========================================================
-    # 🚨 修复 1: Checkout 失败时立刻熔断，防止脏环境运行
-    # ========================================================
+    local INIT_REPO=false
     if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
-        echo "[GitWrapper] [WARN] Empty repo. Initializing..."
+        echo "[GitWrapper] [WARN] Empty repo. Initializing branch..."
         git checkout -b "$BRANCH" 2>/dev/null || {
             echo "[GitWrapper] [FATAL] Failed to create branch: $BRANCH"
             exit 1
         }
-        git add .gitignore
-        git commit -m "Init with .gitignore"
-        git push -u origin "$BRANCH"
+        INIT_REPO=true
     else
         git checkout "$BRANCH" 2>/dev/null || {
             echo "[GitWrapper] [FATAL] Failed to checkout branch: $BRANCH"
             exit 1
         }
+    fi
+
+    # 阶段 1.5: 写入 .gitignore 规则
+    echo "[GitWrapper] [DEBUG] Applying .gitignore rules: $IGNORE_RULES"
+    : > .gitignore # 清空或创建
+    IFS=';' read -ra IGNS <<< "$IGNORE_RULES"
+    for ign in "${IGNS[@]}"; do
+        ign="$(echo "$ign" | xargs)"
+        [ -n "$ign" ] && echo "$ign" >> .gitignore
+    done
+
+    # 只有第一次空仓库时才立马推上去，已有仓库的 .gitignore 变化交给 backup_data 处理
+    if [ "$INIT_REPO" = true ]; then
+        git add .gitignore
+        git commit -m "Init with .gitignore"
+        git push -u origin "$BRANCH" || true
     fi
 
     # ========================================================
@@ -168,7 +168,6 @@ restore_data() {
                 mkdir -p "$(dirname "$local_path")"
             fi
 
-            # 如果是目录（或挂载卷），清空内容而不是删除目录
             if [ -d "$local_path" ]; then
                 echo "[GitWrapper] [DEBUG] Target is directory/volume, cleaning contents..."
                 shopt -s dotglob 2>/dev/null || true
@@ -180,12 +179,10 @@ restore_data() {
                 fi
                 shopt -u dotglob 2>/dev/null || true
             else
-                # 普通文件或路径不存在，直接覆盖
                 rm -rf "$local_path"
                 cp -r "$REMOTE_PATH" "$local_path"
             fi
 
-            # [还原] 脱隐身衣
             if [ -d "$local_path" ]; then
                 find "$local_path" -name ".git_backup_cloak" -type d -prune -exec sh -c 'mv "$1" "${1%_backup_cloak}"' _ {} \; 2>/dev/null || true
             fi
@@ -208,10 +205,9 @@ backup_data() {
 
     if [ ! -d "$GIT_STORE/.git" ]; then 
         echo "[GitWrapper] [ERROR] .git directory missing in $GIT_STORE. Aborting backup."
-        return 0
+        return 1
     fi
 
-    # 砸碎历史遗留的 Rebase 锁并退出游离态
     if [ -d "$GIT_STORE/.git/rebase-merge" ] || [ -d "$GIT_STORE/.git/rebase-apply" ]; then
         echo "[GitWrapper] [WARN] Stale rebase state detected. Smashing the lock..."
         git rebase --abort >/dev/null 2>&1 || rm -rf "$GIT_STORE/.git/rebase-merge" "$GIT_STORE/.git/rebase-apply"
@@ -256,7 +252,7 @@ backup_data() {
         fi
     done
 
-    cd "$GIT_STORE" || { echo "[GitWrapper] [ERROR] Failed to enter $GIT_STORE"; return 0; }
+    cd "$GIT_STORE" || { echo "[GitWrapper] [ERROR] Failed to enter $GIT_STORE"; return 1; }
 
     echo "[GitWrapper] [DEBUG] Checking Git status..."
     local GIT_STATUS
@@ -272,11 +268,12 @@ backup_data() {
         git add .
 
         echo "[GitWrapper] [DEBUG] Committing..."
+        # 🚨 修复 2: commit 失败时返回 1，真实体现失败状态
         if git commit -m "Backup: $(date '+%Y-%m-%d %H:%M:%S')"; then
             echo "[GitWrapper] [INFO] Commit successful."
         else
             echo "[GitWrapper] [ERROR] Commit failed!"
-            return 0
+            return 1
         fi
     else
         echo "[GitWrapper] [INFO] No changes detected. Skipping commit and push."
@@ -287,10 +284,6 @@ backup_data() {
     COMMIT_COUNT=$(git rev-list --count HEAD 2>/dev/null || echo 0)
     echo "[GitWrapper] [DEBUG] Current commit count: $COMMIT_COUNT / Limit: $HISTORY_LIMIT"
 
-    # ========================================================
-    # 🚨 修复 2: 将推送逻辑拆分为 truncate_history 和 normal_push
-    # ========================================================
-    
     normal_push() {
         echo "[GitWrapper] [DEBUG] Pulling latest from origin (rebase)..."
         if ! git pull --rebase origin "$BRANCH"; then
@@ -330,7 +323,13 @@ backup_data() {
         fi
 
         git branch -D "$BRANCH" >/dev/null 2>&1 || true
-        git branch -m "$BRANCH"
+        
+        # 🚨 修复 3: 重命名失败时恢复原提交，防止游离或错乱
+        git branch -m "$BRANCH" || {
+            echo "[GitWrapper] [WARN] Failed to rename reset branch. Fallback to normal push."
+            git checkout -B "$BRANCH" "$original_ref" >/dev/null 2>&1 || return 1
+            return 1
+        }
 
         echo "[GitWrapper] [DEBUG] Force pushing to origin..."
         if git push -f origin "$BRANCH"; then
@@ -349,15 +348,17 @@ backup_data() {
         return 1
     }
 
-    # 执行决策
+    # 决策树
     if [ "$HISTORY_LIMIT" -gt 0 ] && [ "$COMMIT_COUNT" -gt "$HISTORY_LIMIT" ]; then
         truncate_history || normal_push
     else
         normal_push
     fi
     
+    local final_status=$?
     echo "[GitWrapper] [DEBUG] Backup cycle finished."
     echo "[GitWrapper] [DEBUG] ========================================"
+    return $final_status
 }
 
 shutdown_handler() {
@@ -368,7 +369,6 @@ shutdown_handler() {
     fi
     if [ -n "$SYNC_PID" ]; then
         kill -SIGTERM "$SYNC_PID" 2>/dev/null
-        # 退出前做最后一次备份
         backup_data
     fi
     exit 0
@@ -395,14 +395,12 @@ start_main_app() {
     set -m
     local CMD_ARRAY=()
 
-    # 1. 安全复原 Entrypoint
     if [ -n "$ORIGINAL_ENTRYPOINT" ]; then
         echo "[GitWrapper] [DEBUG] Restoring Entrypoint array from GHA @sh format..."
         eval "EP_ARRAY=($ORIGINAL_ENTRYPOINT)"
         CMD_ARRAY+=("${EP_ARRAY[@]}")
     fi
 
-    # 2. 判断是否覆盖了 CMD
     if [ $# -gt 0 ]; then
         echo "[GitWrapper] [DEBUG] Direct arguments detected ($# args). Overriding original CMD."
         CMD_ARRAY+=("$@")
@@ -414,7 +412,6 @@ start_main_app() {
         echo "[GitWrapper] [WARN] No CMD and no arguments provided!"
     fi
 
-    # 安全校验
     if [ ${#CMD_ARRAY[@]} -eq 0 ]; then
         echo "[GitWrapper] [FATAL] Final command array is empty! Cannot start app."
         exit 1
@@ -426,7 +423,6 @@ start_main_app() {
     done
     echo "[GitWrapper] [DEBUG] -------------------------------------"
 
-    # 3. 完美原生地启动应用！
     "${CMD_ARRAY[@]}" 2>&1 &
     APP_PID=$!
 
@@ -452,14 +448,13 @@ main() {
     trap 'shutdown_handler' SIGTERM SIGINT
 
     if init_config; then
-        # 如果 restore 失败，内部会直接 exit 1
         restore_data
 
         (
             set +e
             while true; do
                 sleep "$INTERVAL"
-                backup_data
+                backup_data || echo "[GitWrapper] [WARN] Backup cycle reported an error."
             done
         ) &
         SYNC_PID=$!
@@ -467,7 +462,6 @@ main() {
         echo "[GitWrapper] [WARN] Sync functionality disabled due to configuration error"
     fi
 
-    # 启动应用
     start_main_app "$@"
 }
 
