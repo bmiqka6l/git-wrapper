@@ -153,9 +153,14 @@ restore_data() {
                      cp -r "$REMOTE_PATH" "$local_path"/
                 fi
                 shopt -u dotglob 2>/dev/null || true
+
+                chmod -R 777 "$local_path" 2>/dev/null || true
             else
                 rm -rf "$local_path"
                 cp -r "$REMOTE_PATH" "$local_path"
+
+                chmod 777 "$local_path" 2>/dev/null || true
+                chmod 777 "$(dirname "$local_path")" 2>/dev/null || true
             fi
 
             if [ -d "$local_path" ]; then
