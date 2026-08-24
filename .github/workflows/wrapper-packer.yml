@@ -11,6 +11,11 @@ on:
         description: 'Target Tag Name'
         required: true
         default: 'app-git-sync'
+      force_build:
+        description: 'Force Build (Ignore Cache)'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   build-push:
@@ -61,7 +66,10 @@ jobs:
           DIGEST_SHORT="${UPSTREAM_DIGEST#sha256:}"
           DIGEST_SHORT="${DIGEST_SHORT:0:12}"
 
-          MARKER_TAG="upstream-${DIGEST_SHORT}"
+          # 🚨 核心修复 1: Marker 绑定本地代码的 Commit SHA (取前7位)
+          # 这样只要你改了脚本，哪怕上游镜像没变，也会触发全新的构建！
+          LOCAL_SHA="${GITHUB_SHA:0:7}"
+          MARKER_TAG="upstream-${DIGEST_SHORT}-wrap-${LOCAL_SHA}"
           MARKER_IMAGE="${TARGET_IMAGE}:${MARKER_TAG}"
 
           echo "Checking marker image: ${MARKER_IMAGE}"
@@ -76,6 +84,12 @@ jobs:
           SHOULD_BUILD=true
           if [ "$MARKER_EXISTS" = "true" ]; then
             SHOULD_BUILD=false
+          fi
+
+          # 🚨 核心修复 2: 响应手动强制构建开关
+          if [ "${{ inputs.force_build }}" = "true" ]; then
+            echo "Force build flag is TRUE. Overriding skip logic!"
+            SHOULD_BUILD=true
           fi
 
           docker pull "${BASE_IMAGE}"
@@ -139,6 +153,7 @@ jobs:
           echo "Base Image:          ${BASE_IMAGE}"
           echo "Target Image:        ${TARGET_IMAGE}"
           echo "Upstream Digest:     ${UPSTREAM_DIGEST}"
+          echo "Local Commit SHA:    ${LOCAL_SHA}"
           echo "Marker Image:        ${MARKER_IMAGE}"
           echo "Marker Exists:       ${MARKER_EXISTS}"
           echo "Should Build:        ${SHOULD_BUILD}"
@@ -151,7 +166,7 @@ jobs:
       - name: Skip build
         if: steps.detect.outputs.should_build != 'true'
         run: |
-          echo "This upstream image has already been wrapped."
+          echo "This upstream image (and local code version) has already been wrapped."
           echo "Marker tag: ${{ steps.detect.outputs.marker_tag }}"
 
       - name: Set up QEMU
