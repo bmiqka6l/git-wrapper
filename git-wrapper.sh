@@ -51,13 +51,25 @@ restore_data() {
     git config --global user.email "${USERNAME:-bot}@wrapper.local"
     git config --global init.defaultBranch "$BRANCH"
 
-    local TEMP_CLONE_DIR="/tmp/git-clone-temp-$(date +%s)-$RANDOM"
+    # 🚨 修复1：将临时克隆目录从 /tmp 移出，放在 GIT_STORE 旁边，确保使用主磁盘空间
+    local STORE_PARENT
+    STORE_PARENT=$(dirname "$GIT_STORE")
+    local TEMP_CLONE_DIR="$STORE_PARENT/git-clone-temp-$(date +%s)-$RANDOM"
+    
+    echo "[GitWrapper] [DEBUG] Setting memory-safe Git configs..."
+    # 🚨 修复2：强制限制 Git 内存使用，防止 OOM Killer 杀掉 index-pack 进程
+    git config --global pack.threads 1
+    git config --global pack.windowMemory "128m"
+    git config --global core.packedGitLimit "128m"
+    git config --global core.packedGitWindowSize "32m"
+    
+    echo "[GitWrapper] Cloning to temporary location: $TEMP_CLONE_DIR"
 
+    # 捕获报错并用 sed 正则表达式把凭证替换为 ***，防止 Token 泄露
     if ! CLONE_OUTPUT=$(git clone "$AUTH_URL" "$TEMP_CLONE_DIR" 2>&1); then
         echo "[GitWrapper] [FATAL] Git clone failed. Error details:"
-        # 匹配 :// 到 @ 之间的内容（即账号密码部分），替换为 ***:*** 
         echo "$CLONE_OUTPUT" | sed -E 's|://[^@]+@|://***:***@|g'
-        echo "[GitWrapper] [FATAL] Please check Network or Token validity."
+        echo "[GitWrapper] [FATAL] If it says 'invalid index-pack output', check container RAM limits."
         rm -rf "$TEMP_CLONE_DIR"
         exit 1
     fi
