@@ -53,8 +53,11 @@ restore_data() {
 
     local TEMP_CLONE_DIR="/tmp/git-clone-temp-$(date +%s)-$RANDOM"
 
-    if ! git clone "$AUTH_URL" "$TEMP_CLONE_DIR" >/dev/null 2>&1; then
-        echo "[GitWrapper] [FATAL] Git clone failed. Check network or credentials."
+    if ! CLONE_OUTPUT=$(git clone "$AUTH_URL" "$TEMP_CLONE_DIR" 2>&1); then
+        echo "[GitWrapper] [FATAL] Git clone failed. Error details:"
+        # 匹配 :// 到 @ 之间的内容（即账号密码部分），替换为 ***:*** 
+        echo "$CLONE_OUTPUT" | sed -E 's|://[^@]+@|://***:***@|g'
+        echo "[GitWrapper] [FATAL] Please check Network or Token validity."
         rm -rf "$TEMP_CLONE_DIR"
         exit 1
     fi
