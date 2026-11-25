@@ -49,3 +49,12 @@ jobs:
             --ref main \
             -f base_image=ghcr.io/jbtt-2025/pico-claw-web:latest \
             -f target_tag=pico-claw-web-git-sync
+      # === 任务 4: 同步 magpie ===
+      - name: Trigger magpie Wrapper
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run wrapper-packer.yml \
+            --ref main \
+            -f base_image=ghcr.io/yetone/magpie:latest \
+            -f target_tag=magpie-git-sync
